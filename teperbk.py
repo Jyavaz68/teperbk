@@ -13,6 +13,7 @@ import uuid
 import threading
 import itertools
 import shlex
+import zipfile
 
 class Colors:
     HEADER = '\033[95m'
@@ -679,6 +680,62 @@ def send_telegram_file(token, chat_id, file_path, caption=""):
     except Exception as e:
         return False, f"Connection error: {e}"
 
+def _file_not_empty(path):
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+def detect_db_type_local():
+    """Detect the database used by the local Pasarguard installation
+    by reading the services defined in /opt/pasarguard/docker-compose.yml."""
+    compose_file = os.path.join(PASARGUARD_DIR, "docker-compose.yml")
+    if not os.path.isfile(compose_file):
+        print_error(f"Cannot find {compose_file}. Is Pasarguard installed on this server?")
+        return None
+
+    ok, out, err = local_shell("docker compose config --services", cwd=PASARGUARD_DIR)
+    if not ok:
+        print_error("Could not read the docker compose services.")
+        if err:
+            print_error(f"Details: {err}")
+        return None
+
+    services = [line.strip() for line in out.splitlines() if line.strip()]
+
+    if "timescaledb" in services:
+        print_success("Detected database: TimescaleDB (PostgreSQL)")
+        return "timescaledb"
+    if "mysql" in services:
+        print_success("Detected database: MySQL")
+        return "mysql"
+
+    db_url = _read_env_var(os.path.join(PASARGUARD_DIR, ".env"), "SQLALCHEMY_DATABASE_URL") or ""
+    scheme = db_url.split("://", 1)[0] if "://" in db_url else "unknown"
+    print_error("Unsupported or undetected database.")
+    print_error(f"Compose services: {', '.join(services) if services else 'none'} | DB driver in .env: {scheme}")
+    print_error("This tool supports only TimescaleDB and MySQL (running as docker compose services).")
+    return None
+
+def detect_db_type_from_zip(zip_path):
+    """Detect the database type from the content of a backup ZIP."""
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            names = set(z.namelist())
+    except Exception as e:
+        print_error(f"Cannot read the ZIP file: {e}")
+        return None
+
+    if "pg_dump/db-001.sql" in names:
+        print_success("Backup database type: TimescaleDB (PostgreSQL)")
+        return "timescaledb"
+    if "pg_dump/db_backup.sql" in names:
+        print_success("Backup database type: MySQL")
+        return "mysql"
+
+    print_error("This ZIP does not look like a valid backup (no database dump found).")
+    return None
+
 def _create_backup_core(db_type="timescaledb"):
     print_info("Starting Backup Generation...")
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -713,11 +770,15 @@ def _create_backup_core(db_type="timescaledb"):
         if db_type == "timescaledb":
             print_info("Exporting PostgreSQL globals... (This may take a moment)")
             cmd_globals = "docker compose exec -T timescaledb pg_dumpall -U pasarguard --globals-only"
-            run_command(cmd_globals, output_file=os.path.join(pg_dump_dir, "globals.sql"), cwd=opt_dir)
+            globals_path = os.path.join(pg_dump_dir, "globals.sql")
+            if not run_command(cmd_globals, output_file=globals_path, cwd=opt_dir) or not _file_not_empty(globals_path):
+                raise Exception("Database globals export failed (is the timescaledb container running?)")
 
             print_info("Exporting Pasarguard database... (Please wait, this might take a while for large databases)")
             cmd_db = "docker compose exec -T timescaledb pg_dump -U pasarguard -d pasarguard"
-            run_command(cmd_db, output_file=os.path.join(pg_dump_dir, "db-001.sql"), cwd=opt_dir)
+            dump_path = os.path.join(pg_dump_dir, "db-001.sql")
+            if not run_command(cmd_db, output_file=dump_path, cwd=opt_dir) or not _file_not_empty(dump_path):
+                raise Exception("Database export failed or produced an empty file. Backup aborted.")
 
             print_info("Creating manifest file...")
             with open(os.path.join(pg_dump_dir, "manifest.tsv"), "w") as f:
@@ -725,7 +786,9 @@ def _create_backup_core(db_type="timescaledb"):
         else:
             print_info("Exporting MySQL database... (Please wait, this might take a while for large databases)")
             cmd_db = 'docker compose exec -T mysql sh -c \'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" pasarguard\''
-            run_command(cmd_db, output_file=os.path.join(pg_dump_dir, "db_backup.sql"), cwd=opt_dir)
+            dump_path = os.path.join(pg_dump_dir, "db_backup.sql")
+            if not run_command(cmd_db, output_file=dump_path, cwd=opt_dir) or not _file_not_empty(dump_path):
+                raise Exception("Database export failed or produced an empty file. Backup aborted.")
 
         print_info("Copying Pasarguard data directory...")
         if os.path.exists(data_dir):
@@ -1090,7 +1153,7 @@ def workflow_manual_backup(db_type="timescaledb"):
     else:
         print_error("Manual backup failed!")
 
-def workflow_manual_restore(db_type="timescaledb"):
+def workflow_manual_restore():
     print_header("Manual Restore (Local)")
     print_info("This process will wipe the current Pasarguard & PG-Node setup and restore from a ZIP file.")
     
@@ -1098,6 +1161,10 @@ def workflow_manual_restore(db_type="timescaledb"):
     
     if not os.path.exists(zip_name):
         print_error(f"Cannot find the file '{zip_name}' in the current directory!")
+        return
+
+    db_type = detect_db_type_from_zip(zip_name)
+    if not db_type:
         return
 
     confirm = input(f"{Colors.RED}⚠️  WARNING: This will overwrite your current configuration and database. Continue? (y/n): {Colors.RESET}").strip().lower()
@@ -1209,13 +1276,14 @@ def main():
         
         choice = input(f"{Colors.CYAN}👉 Please select an option (1-5): {Colors.RESET}").strip()
         
-        db_type = "timescaledb"
-        if choice in ['1', '2', '3', '4']:
+        db_type = None
+        if choice in ['1', '2', '3']:
             print("")
-            db_choice = input(f"{Colors.CYAN}🗄️  Which database are you using? (1: timescaledb, 2: mysql): {Colors.RESET}").strip()
-            if db_choice == '2':
-                db_type = "mysql"
-        
+            db_type = detect_db_type_local()
+            if not db_type:
+                pause_and_return()
+                continue
+
         if choice == '1':
             workflow_auto_backup_restore(db_type)
             pause_and_return()
@@ -1226,7 +1294,7 @@ def main():
             workflow_manual_backup(db_type)
             pause_and_return()
         elif choice == '4':
-            workflow_manual_restore(db_type)
+            workflow_manual_restore()
             pause_and_return()
         elif choice == '5':
             print(f"{Colors.YELLOW}🚪 Exiting... Have a great day!{Colors.RESET}")

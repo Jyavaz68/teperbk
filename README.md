@@ -11,7 +11,8 @@ Backup, restore & server migration tool for **PasarGuard** and **PG-Node**.
 
 ### Features
 - Full backup of PasarGuard + PG-Node (config, data, database)
-- Supports **TimescaleDB (PostgreSQL)** and **MySQL**
+- Supports **TimescaleDB (PostgreSQL)** and **MySQL**, and **detects your database automatically** (no questions asked)
+- Aborts the backup if the database export fails, so you never end up with an empty backup
 - One-step migration to a new server over SSH
 - Scheduled automatic backups sent to a Telegram bot
 - Manual local backup and restore
@@ -42,7 +43,7 @@ python3 teperbk.py
 | 4 | Manual Restore | Restore from a local ZIP (wipes the current setup) |
 | 5 | Exit | |
 
-After choosing 1-4, the script asks which database you use: `1` = timescaledb, `2` = mysql.
+The database type is **detected automatically**: for backups it reads the services in `/opt/pasarguard/docker-compose.yml`, and for restore it reads the content of the ZIP file. If your panel uses something else (SQLite, MariaDB, plain PostgreSQL), the script tells you it is unsupported and stops.
 
 ### Backup mode (options 1 and 3)
 The script asks: *Stop Pasarguard & PG-Node during backup?*
@@ -99,7 +100,7 @@ You can turn these off again after the migration.
 
 #### Step 3: Do a TEST run first
 On the **old** server, install and run the script (see Install above). Then:
-1. Choose option **1** and pick your database.
+1. Choose option **1** (the database is detected automatically).
 2. Answer **n** to "Stop Pasarguard & PG-Node during backup?". Nothing goes down.
 3. Enter the new server IP, SSH port and root password.
 
@@ -206,7 +207,8 @@ docker ps
 
 ### امکانات
 - بکاپ کامل پاسارگاد و PG-Node (تنظیمات، دیتا و دیتابیس)
-- پشتیبانی از **TimescaleDB (PostgreSQL)** و **MySQL**
+- پشتیبانی از **TimescaleDB (PostgreSQL)** و **MySQL** و **تشخیص خودکار دیتابیس** (بدون هیچ سؤالی)
+- اگر خروجی گرفتن از دیتابیس خطا بدهد، بکاپ متوقف می‌شود تا بکاپ خالی نگیری
 - انتقال یک‌مرحله‌ای به سرور جدید از طریق SSH
 - بکاپ خودکار زمان‌بندی‌شده و ارسال به ربات تلگرام
 - بکاپ و ریستور دستی (لوکال)
@@ -245,7 +247,7 @@ python3 teperbk.py
 | ۴ | ریستور دستی | ریستور از زیپ لوکال (تنظیمات فعلی پاک می‌شود) |
 | ۵ | خروج | |
 
-بعد از انتخاب گزینه ۱ تا ۴، اسکریپت می‌پرسد از چه دیتابیسی استفاده می‌کنی: `1` = timescaledb و `2` = mysql.
+نوع دیتابیس **خودکار تشخیص داده می‌شود**: برای بکاپ از سرویس‌های `/opt/pasarguard/docker-compose.yml` و برای ریستور از محتوای فایل ZIP. اگر پنل تو از چیز دیگری استفاده می‌کند (SQLite، MariaDB یا PostgreSQL ساده)، اسکریپت می‌گوید پشتیبانی نمی‌شود و متوقف می‌شود.
 
 ### حالت بکاپ (گزینه‌های ۱ و ۳)
 اسکریپت می‌پرسد: *Stop Pasarguard & PG-Node during backup?*
@@ -326,7 +328,7 @@ systemctl restart ssh
 
 #### مرحله ۳: اول یک اجرای تست
 روی سرور **قدیم** اسکریپت را نصب و اجرا کن (بخش نصب بالا). بعد:
-۱. گزینه **۱** را بزن و دیتابیس را انتخاب کن.
+۱. گزینه **۱** را بزن (دیتابیس خودکار تشخیص داده می‌شود).
 ۲. به سؤال «Stop Pasarguard & PG-Node during backup?» جواب **n** بده. هیچ‌چیز قطع نمی‌شود.
 ۳. IP سرور جدید، پورت SSH و پسورد root را وارد کن.
 
