@@ -30,9 +30,13 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/jyavaz68/teperbk/main/in
 ```
 
 ### Run again
+After installation, the tool is available as a command from anywhere:
 ```bash
-python3 teperbk.py
+teperbk
 ```
+- The script is installed in `/opt/teperbk/teperbk.py`.
+- Backup ZIP files are saved in `/root` (never inside `/opt/pasarguard`, because a restore wipes that folder).
+- To update to the latest version, just run the install command again.
 
 ### Menu
 | # | Option | Description |
@@ -230,13 +234,19 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/jyavaz68/teperbk/main/in
 <div dir="rtl">
 
 ### اجرای مجدد
+بعد از نصب، ابزار به‌صورت یک دستور از هر مسیری در دسترس است:
 </div>
 
 ```bash
-python3 teperbk.py
+teperbk
 ```
 
 <div dir="rtl">
+
+- اسکریپت در مسیر `/opt/teperbk/teperbk.py` نصب می‌شود.
+- فایل‌های زیپ بکاپ در `/root` ذخیره می‌شوند (نه داخل `/opt/pasarguard`، چون ریستور آن پوشه را پاک می‌کند).
+- برای آپدیت به آخرین نسخه، فقط دستور نصب را دوباره اجرا کن.
+
 
 ### منو
 | # | گزینه | توضیح |
