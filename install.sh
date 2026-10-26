@@ -40,6 +40,12 @@ cd /root && exec python3 /opt/teperbk/teperbk.py "$@"
 WRAP
     chmod +x "$CMD"
 
+    # If the Telegram bot service is already installed, restart it to load the new version
+    if systemctl is-active --quiet teperbk-bot 2>/dev/null; then
+        systemctl restart teperbk-bot
+        echo -e "${GREEN}✔ Telegram bot service restarted with the new version.${NC}"
+    fi
+
     echo -e "${GREEN}✔ Installed successfully!${NC}"
     echo -e "${CYAN}➔ From now on, just type:  ${GREEN}teperbk${NC}"
     echo -e "${CYAN}➔ Backups are saved in:    ${GREEN}/root${NC}"
