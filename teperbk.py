@@ -19,6 +19,11 @@ import re
 import socket
 import tempfile
 import fcntl
+import http.client
+import urllib.parse
+
+VERSION = "1.1.0"
+UPDATE_URL = "https://raw.githubusercontent.com/jyavaz68/teperbk/main/teperbk.py"
 
 class Colors:
     HEADER = '\033[95m'
@@ -633,58 +638,6 @@ def start_compose_stack_ssh(ssh, compose_dir, label, services=None, wait_postgre
         print_error(status)
     return False
 
-def send_telegram_file(token, chat_id, file_path, caption=""):
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
-    boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
-    
-    if not os.path.exists(file_path):
-        return False, "File not found"
-
-    try:
-        with open(file_path, "rb") as f:
-            file_content = f.read()
-    except Exception as e:
-        return False, f"Read error: {e}"
-
-    file_name = os.path.basename(file_path)
-    parts = []
-    
-    parts.append(f"--{boundary}".encode('utf-8'))
-    parts.append(f'Content-Disposition: form-data; name="chat_id"'.encode('utf-8'))
-    parts.append(b'')
-    parts.append(str(chat_id).encode('utf-8'))
-    
-    if caption:
-        parts.append(f"--{boundary}".encode('utf-8'))
-        parts.append(f'Content-Disposition: form-data; name="caption"'.encode('utf-8'))
-        parts.append(b'')
-        parts.append(caption.encode('utf-8'))
-        
-    parts.append(f"--{boundary}".encode('utf-8'))
-    parts.append(f'Content-Disposition: form-data; name="document"; filename="{file_name}"'.encode('utf-8'))
-    parts.append(b'Content-Type: application/zip')
-    parts.append(b'')
-    parts.append(file_content)
-    
-    parts.append(f"--{boundary}--".encode('utf-8'))
-    parts.append(b'')
-    
-    body = b'\r\n'.join(parts)
-    
-    req = urllib.request.Request(url, data=body)
-    req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-    req.add_header('Content-Length', str(len(body)))
-    
-    try:
-        with urllib.request.urlopen(req, timeout=900) as response:
-            res_body = response.read().decode('utf-8')
-            return True, res_body
-    except urllib.error.HTTPError as e:
-        err_msg = e.read().decode('utf-8')
-        return False, f"HTTP Error {e.code}: {err_msg}"
-    except Exception as e:
-        return False, f"Connection error: {str(e).replace(token, '***')}"
-
 def _file_not_empty(path):
     try:
         return os.path.isfile(path) and os.path.getsize(path) > 0
@@ -1093,60 +1046,6 @@ def workflow_auto_backup_restore(db_type="timescaledb"):
         except:
             pass
 
-def workflow_backup_bot(db_type="timescaledb"):
-    print_header("Auto Backup to Telegram Bot (Scheduled)")
-    
-    bot_token = input(f"{Colors.CYAN}🔑 Enter Telegram Bot Token: {Colors.RESET}").strip()
-    while not bot_token:
-        bot_token = input(f"{Colors.RED}Token cannot be empty!{Colors.RESET} {Colors.CYAN}Enter Bot Token:{Colors.RESET} ").strip()
-
-    admin_id = input(f"{Colors.CYAN}👤 Enter Admin Numeric Chat ID: {Colors.RESET}").strip()
-    while not admin_id or not admin_id.lstrip('-').isdigit():
-        admin_id = input(f"{Colors.RED}Invalid ID!{Colors.RESET} {Colors.CYAN}Enter Admin Numeric Chat ID:{Colors.RESET} ").strip()
-
-    try:
-        interval_input = input(f"{Colors.CYAN}⏱️  Enter interval in hours (e.g., 0.5 for 30 mins, 1 for 1 hour): {Colors.RESET}").strip()
-        interval_hours = float(interval_input)
-    except ValueError:
-        print_warning("Invalid number. Defaulting to 1.0 hour.")
-        interval_hours = 1.0
-
-    interval_seconds = int(interval_hours * 3600)
-    print_info(f"Scheduler started! Backups will run every {interval_hours} hours.")
-    print_warning("Press Ctrl+C at any time to stop this utility.")
-    print("-" * 50)
-
-    try:
-        while True:
-            current_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n{Colors.BOLD}⏳ Starting scheduled task at {current_time_str}...{Colors.RESET}")
-            
-            zip_file_path = create_backup(db_type)
-            
-            if zip_file_path and os.path.exists(zip_file_path):
-                print_info("Uploading to Telegram...")
-                caption = f"🤖 Pasarguard & PG-Node Auto Backup\nDate: {current_time_str}\nInterval: {interval_hours} hrs"
-                success, details = send_telegram_file(bot_token, admin_id, zip_file_path, caption=caption)
-                
-                if success:
-                    print_success("Backup sent to Telegram!")
-                else:
-                    print_error(f"Failed to send to Telegram: {details}")
-                
-                try:
-                    os.remove(zip_file_path)
-                    print_info("Local ZIP file removed to save disk space.")
-                except Exception:
-                    pass
-            else:
-                print_error("Backup failed. Skipping Telegram upload.")
-
-            print_info(f"Sleeping for {interval_hours} hours... (Zzz)")
-            time.sleep(interval_seconds)
-
-    except KeyboardInterrupt:
-        print(f"\n{Colors.YELLOW}🚪 Backup scheduler stopped by user.{Colors.RESET}")
-
 def workflow_manual_backup(db_type="timescaledb"):
     print_header("Manual Backup (Local)")
     print_info("This will create a backup and save it in the current directory.")
@@ -1263,6 +1162,128 @@ def workflow_manual_restore():
         print_warning("Your system might be in a partially restored state.")
 
 # ============================================================================
+#  Time zone, Jalali (Shamsi) calendar helpers
+# ============================================================================
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:   # Python < 3.9
+    ZoneInfo = None
+
+def get_tz(name):
+    """tzinfo for an IANA name. '' / 'local' = the server's own time zone."""
+    if name and name.lower() not in ("local", "server"):
+        if ZoneInfo:
+            try:
+                return ZoneInfo(name)
+            except Exception:
+                pass
+        if name == "Asia/Tehran":   # Iran has no DST anymore
+            return datetime.timezone(datetime.timedelta(hours=3, minutes=30))
+    return datetime.datetime.now().astimezone().tzinfo
+
+def normalize_tz_name(name):
+    """Return a valid zone name ('' for the server time zone) or None."""
+    name = (name or "").strip()
+    if name.lower() in ("", "local", "server"):
+        return ""
+    if ZoneInfo:
+        try:
+            ZoneInfo(name)
+            return name
+        except Exception:
+            return None
+    return name if name == "Asia/Tehran" else None
+
+def user_tz(cfg):
+    return get_tz(cfg.get("tz", ""))
+
+def tz_label(cfg):
+    name = cfg.get("tz") or "server"
+    off = datetime.datetime.now(user_tz(cfg)).strftime("%z")
+    return f"{name} (UTC{off[:3]}:{off[3:]})" if len(off) == 5 else name
+
+def gregorian_to_jalali(gy, gm, gd):
+    g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (355666 + (365 * gy) + ((gy2 + 3) // 4) - ((gy2 + 99) // 100)
+            + ((gy2 + 399) // 400) + gd + g_d_m[gm - 1])
+    jy = -1595 + (33 * (days // 12053))
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        jm = 1 + days // 31
+        jd = 1 + days % 31
+    else:
+        jm = 7 + (days - 186) // 30
+        jd = 1 + (days - 186) % 30
+    return jy, jm, jd
+
+def jalali_to_gregorian(jy, jm, jd):
+    jy += 1595
+    days = -355668 + (365 * jy) + ((jy // 33) * 8) + (((jy % 33) + 3) // 4) + jd
+    days += ((jm - 1) * 31) if jm < 7 else (((jm - 7) * 30) + 186)
+    gy = 400 * (days // 146097)
+    days %= 146097
+    if days > 36524:
+        days -= 1
+        gy += 100 * (days // 36524)
+        days %= 36524
+        if days >= 365:
+            days += 1
+    gy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        gy += (days - 1) // 365
+        days = (days - 1) % 365
+    gd = days + 1
+    leap = (gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0
+    month_days = [0, 31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    gm = 0
+    while gm < 13 and gd > month_days[gm]:
+        gd -= month_days[gm]
+        gm += 1
+    return gy, gm, gd
+
+_FA_TO_EN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+_EN_TO_FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+def to_fa_digits(text):
+    return str(text).translate(_EN_TO_FA)
+
+def fmt_dt(ts, cfg):
+    """Format a timestamp: Jalali date for Persian, normal date for English."""
+    dt = datetime.datetime.fromtimestamp(ts, user_tz(cfg))
+    if cfg.get("lang", "fa") == "fa":
+        jy, jm, jd = gregorian_to_jalali(dt.year, dt.month, dt.day)
+        return to_fa_digits(f"{jy:04d}/{jm:02d}/{jd:02d} {dt:%H:%M}")
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+def parse_datetime_input(text, tz):
+    """'1405/08/29 14:30' (Jalali) or '2026-11-20 14:30' (Gregorian) -> (timestamp, None)."""
+    t = (text or "").translate(_FA_TO_EN).replace("،", " ").strip()
+    m = re.fullmatch(r"(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})[\sT,]+(\d{1,2})(?::(\d{1,2}))?", t)
+    if not m:
+        return None, "format"
+    y, mo, d, h, mi = (int(m.group(i) or 0) for i in range(1, 6))
+    try:
+        if y < 1700:   # Jalali
+            if not (1 <= mo <= 12 and 1 <= d <= 31):
+                return None, "date"
+            gy, gm, gd = jalali_to_gregorian(y, mo, d)
+            if gregorian_to_jalali(gy, gm, gd) != (y, mo, d):
+                return None, "date"
+        else:
+            gy, gm, gd = y, mo, d
+        dt = datetime.datetime(gy, gm, gd, h, mi, tzinfo=tz)
+    except (ValueError, OverflowError):
+        return None, "date"
+    return dt.timestamp(), None
+
+# ============================================================================
 #  Telegram Bot + Daily Cron Scheduler
 # ============================================================================
 CONFIG_DIR = "/opt/teperbk"
@@ -1275,9 +1296,16 @@ SERVICE_NAME = "teperbk-bot"
 SERVICE_FILE = f"/etc/systemd/system/{SERVICE_NAME}.service"
 LOGROTATE_FILE = "/etc/logrotate.d/teperbk"
 LOG_FILE = "/var/log/teperbk.log"
+WRAPPER_PATH = "/usr/local/bin/teperbk"
 
-TG_MAX_BYTES = 49 * 1024 * 1024    # Bot API upload limit is 50 MB
-TG_PART_BYTES = 45 * 1024 * 1024   # size of each part when a backup is bigger
+CLOUD_API = "https://api.telegram.org"
+LOCAL_API = "http://127.0.0.1:8081"
+LOCAL_API_CONTAINER = "teperbk-botapi"
+LOCAL_API_IMAGE = "aiogram/telegram-bot-api:latest"
+
+MB = 1024 * 1024
+CLOUD_MAX_BYTES, CLOUD_PART_BYTES = 49 * MB, 45 * MB        # normal Bot API: 50 MB per file
+LOCAL_MAX_BYTES, LOCAL_PART_BYTES = 1950 * MB, 1900 * MB    # local Bot API server: 2000 MB per file
 
 SCHEDULE_PRESETS = {
     "1": ["03:00"],
@@ -1290,11 +1318,17 @@ DEFAULT_CONFIG = {
     "bot_token": "",
     "admin_chat_id": "",
     "times": ["03:00"],
+    "tz": "Asia/Tehran",
     "lang": "fa",
+    "one_time": [],
     "last_backup": None,
+    "large_files": False,
+    "api_base": "",
+    "api_id": "",
+    "api_hash": "",
 }
 
-BOT_AWAITING = {}   # chat_id -> "times" while the bot waits for custom times
+BOT_AWAITING = {}   # chat_id -> "times" | "once" while the bot waits for the admin's next message
 
 BOT_STR = {
     "en": {
@@ -1303,13 +1337,24 @@ BOT_STR = {
         "b_status": "📊 Status",
         "b_sched": "⏰ Schedule",
         "b_lang": "🌐 Language / زبان",
-        "b_custom": "✏️ Custom times",
+        "b_custom": "✏️ Custom daily times",
+        "b_once": "📅 One-time backup (date & time)",
+        "b_once_cancel": "🗑 Cancel dated backups",
         "b_back": "⬅️ Back",
-        "sched_title": "⏰ How many backups per day?\nPick a preset or send your own times.",
+        "sched_title": "⏰ How many backups per day?\nPick a preset, send custom times, or plan a one-time backup.\n🕒 Time zone: {tz}",
         "ask_times": "Send the daily backup times in 24h format, separated by comma or space.\nExample: 03:00, 15:30\nOne time = once a day, three times = three backups a day.\nSend /cancel to cancel.",
-        "times_ok": "✅ Schedule saved.\n⏰ Times: {times}\n🕒 Server time zone: {tz}\nThe cron job on the server was updated automatically.",
+        "times_ok": "✅ Schedule saved.\n⏰ Times: {times}\n🕒 Time zone: {tz}\nThe cron job on the server was updated automatically.",
         "times_bad": "❌ Invalid input: {err}\nExample: 03:00, 15:30",
-        "cron_fail": "⚠️ Schedule saved but the cron job could not be written: {err}",
+        "ask_once": "Send the date and time of the one-time backup.\nExample: 1405/08/29 14:30 (Jalali) or 2026-11-20 14:30\n🕒 Time zone: {tz}\nSend /cancel to cancel.",
+        "once_ok": "✅ One-time backup scheduled for {when}\n🕒 {tz}",
+        "once_bad": "❌ Invalid date/time. Example: 1405/08/29 14:30",
+        "once_past": "❌ That time is already in the past.",
+        "once_cancelled": "🗑 {n} dated backup(s) cancelled.",
+        "once_run": "⏰ Running the scheduled backup for {when}...",
+        "once_missed": "⚠️ The backup planned for {when} was missed because the bot was offline.",
+        "tz_ok": "✅ Time zone set to {tz}. The cron job was updated.",
+        "tz_bad": "❌ Unknown time zone. Example: /settz Asia/Tehran",
+        "cron_fail": "⚠️ Saved, but the cron job could not be written: {err}",
         "backup_start": "⏳ Backup started... this can take a few minutes.",
         "backup_busy": "⏳ Another backup is already running. Try again later.",
         "backup_fail": "❌ Backup failed. Check the server log: {log}",
@@ -1317,7 +1362,7 @@ BOT_STR = {
         "upload_fail": "⚠️ The backup was created on the server but sending it to Telegram failed:\n{err}",
         "caption": "📦 PasarGuard backup\n🖥 Server: {host}\n🗄 Database: {db}\n📏 Size: {size}\n🕒 Time: {time}",
         "part_note": "🧩 Part {i} of {n}\nJoin on the server: cat {name}.part* > {name}",
-        "status": "📊 Status\n🖥 Server: {host}\n⏰ Daily times: {times}\n🕒 Time zone: {tz}\n🗂 Last backup: {last}\n💾 Kept on server: {file}\n🔁 Cron job: {cron}",
+        "status": "📊 Status\n🖥 Server: {host}\n⏰ Daily times: {times}\n🕒 Time zone: {tz}\n📅 Dated backups: {once}\n🗂 Last backup: {last}\n💾 Kept on server: {file}\n🔁 Cron job: {cron}\n📤 Max file size: {limit}",
         "last_none": "no backup yet",
         "file_none": "none",
         "on": "active ✅",
@@ -1331,13 +1376,24 @@ BOT_STR = {
         "b_status": "📊 وضعیت",
         "b_sched": "⏰ زمان‌بندی",
         "b_lang": "🌐 Language / زبان",
-        "b_custom": "✏️ زمان دلخواه",
+        "b_custom": "✏️ ساعت‌های روزانه دلخواه",
+        "b_once": "📅 بکاپ در تاریخ و ساعت مشخص",
+        "b_once_cancel": "🗑 لغو بکاپ‌های تاریخ‌دار",
         "b_back": "⬅️ بازگشت",
-        "sched_title": "⏰ روزی چند بار بکاپ بفرستم؟\nیکی از گزینه‌ها را بزن یا ساعت‌های دلخواهت را بفرست.",
+        "sched_title": "⏰ روزی چند بار بکاپ بفرستم؟\nیکی از گزینه‌ها را بزن، ساعت دلخواه بفرست یا یک بکاپ تک‌باره در تاریخ مشخص بگذار.\n🕒 منطقه زمانی: {tz}",
         "ask_times": "ساعت‌های بکاپ روزانه را با فرمت ۲۴ ساعته بفرست (با کاما یا فاصله جدا کن).\nمثال: 03:00, 15:30\nیک ساعت = روزی یک بار، سه ساعت = روزی سه بار.\nبرای لغو: /cancel",
-        "times_ok": "✅ زمان‌بندی ذخیره شد.\n⏰ ساعت‌ها: {times}\n🕒 منطقه زمانی سرور: {tz}\nکرون‌جاب روی سرور خودکار به‌روز شد.",
+        "times_ok": "✅ زمان‌بندی ذخیره شد.\n⏰ ساعت‌ها: {times}\n🕒 منطقه زمانی: {tz}\nکرون‌جاب روی سرور خودکار به‌روز شد.",
         "times_bad": "❌ ورودی نامعتبر: {err}\nمثال: 03:00, 15:30",
-        "cron_fail": "⚠️ زمان‌بندی ذخیره شد ولی کرون‌جاب ساخته نشد: {err}",
+        "ask_once": "تاریخ و ساعت بکاپ را بفرست.\nمثال شمسی: 1405/08/29 14:30\n(تاریخ میلادی هم قبول است: 2026-11-20 14:30)\n🕒 منطقه زمانی: {tz}\nبرای لغو: /cancel",
+        "once_ok": "✅ بکاپ برای {when} زمان‌بندی شد.\n🕒 {tz}",
+        "once_bad": "❌ تاریخ یا ساعت نامعتبر است. مثال: 1405/08/29 14:30",
+        "once_past": "❌ این زمان گذشته است.",
+        "once_cancelled": "🗑 {n} بکاپ تاریخ‌دار لغو شد.",
+        "once_run": "⏰ در حال اجرای بکاپ زمان‌بندی‌شده برای {when}...",
+        "once_missed": "⚠️ بکاپ زمان‌بندی‌شده برای {when} اجرا نشد، چون ربات در آن زمان خاموش بود.",
+        "tz_ok": "✅ منطقه زمانی روی {tz} تنظیم شد و کرون‌جاب به‌روز شد.",
+        "tz_bad": "❌ منطقه زمانی نامعتبر است. مثال: /settz Asia/Tehran",
+        "cron_fail": "⚠️ ذخیره شد ولی کرون‌جاب ساخته نشد: {err}",
         "backup_start": "⏳ بکاپ شروع شد... چند دقیقه طول می‌کشد.",
         "backup_busy": "⏳ یک بکاپ دیگر در حال انجام است. بعداً دوباره امتحان کن.",
         "backup_fail": "❌ بکاپ ناموفق بود. لاگ سرور را چک کن: {log}",
@@ -1345,7 +1401,7 @@ BOT_STR = {
         "upload_fail": "⚠️ بکاپ روی سرور ساخته شد ولی ارسال به تلگرام ناموفق بود:\n{err}",
         "caption": "📦 بکاپ پاسارگاد\n🖥 سرور: {host}\n🗄 دیتابیس: {db}\n📏 حجم: {size}\n🕒 زمان: {time}",
         "part_note": "🧩 بخش {i} از {n}\nبرای ادغام روی سرور: cat {name}.part* > {name}",
-        "status": "📊 وضعیت\n🖥 سرور: {host}\n⏰ ساعت‌های بکاپ: {times}\n🕒 منطقه زمانی: {tz}\n🗂 آخرین بکاپ: {last}\n💾 فایل روی سرور: {file}\n🔁 کرون‌جاب: {cron}",
+        "status": "📊 وضعیت\n🖥 سرور: {host}\n⏰ ساعت‌های روزانه: {times}\n🕒 منطقه زمانی: {tz}\n📅 بکاپ‌های تاریخ‌دار: {once}\n🗂 آخرین بکاپ: {last}\n💾 فایل روی سرور: {file}\n🔁 کرون‌جاب: {cron}\n📤 حداکثر حجم فایل: {limit}",
         "last_none": "هنوز بکاپی گرفته نشده",
         "file_none": "ندارد",
         "on": "فعال ✅",
@@ -1378,6 +1434,16 @@ def save_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONFIG_FILE)
 
+def update_config(mutator):
+    """Load -> change -> save under a file lock (the bot, cron and the menu may write at the same time)."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE + ".lock", "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        cfg = load_config()
+        mutator(cfg)
+        save_config(cfg)
+        return cfg
+
 def is_configured(cfg):
     return bool(cfg.get("bot_token") and str(cfg.get("admin_chat_id")).strip())
 
@@ -1391,8 +1457,20 @@ def server_timezone():
     return datetime.datetime.now().astimezone().strftime("%Z (UTC%z)")
 
 # ------------------------------------------------------------- telegram ----
-def tg_api(token, method, params=None, timeout=30):
-    url = f"https://api.telegram.org/bot{token}/{method}"
+def api_base_for(token):
+    """Local Bot API server (2 GB files) is used only for the configured bot."""
+    cfg = load_config()
+    if cfg.get("large_files") and cfg.get("api_base") and cfg.get("bot_token") == token:
+        return cfg["api_base"]
+    return CLOUD_API
+
+def tg_limits(cfg):
+    if cfg.get("large_files") and cfg.get("api_base"):
+        return LOCAL_MAX_BYTES, LOCAL_PART_BYTES
+    return CLOUD_MAX_BYTES, CLOUD_PART_BYTES
+
+def tg_api(token, method, params=None, timeout=30, base=None):
+    url = f"{base or api_base_for(token)}/bot{token}/{method}"
     data = json.dumps(params or {}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
@@ -1412,11 +1490,56 @@ def tg_send(cfg, text, keyboard=None):
         params["reply_markup"] = {"inline_keyboard": keyboard}
     return tg_api(cfg["bot_token"], "sendMessage", params)
 
+def send_telegram_file(token, chat_id, file_path, caption=""):
+    """Stream a file to Telegram (sendDocument) without loading it into memory."""
+    if not os.path.exists(file_path):
+        return False, "File not found"
+
+    base = urllib.parse.urlparse(api_base_for(token))
+    boundary = f"----teperbk{uuid.uuid4().hex}"
+    file_name = os.path.basename(file_path)
+    size = os.path.getsize(file_path)
+
+    def text_field(name, value):
+        return (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").encode("utf-8")
+
+    head = text_field("chat_id", chat_id)
+    if caption:
+        head += text_field("caption", caption)
+    head += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{file_name}\"\r\n"
+             f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+    tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    conn_class = http.client.HTTPSConnection if base.scheme == "https" else http.client.HTTPConnection
+    timeout = 900 if size <= CLOUD_MAX_BYTES else 7200
+    conn = conn_class(base.hostname, base.port, timeout=timeout)
+    try:
+        conn.putrequest("POST", f"/bot{token}/sendDocument")
+        conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        conn.putheader("Content-Length", str(len(head) + size + len(tail)))
+        conn.endheaders()
+        conn.send(head)
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        conn.send(tail)
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", "replace")
+        if resp.status == 200:
+            return True, body
+        return False, f"HTTP Error {resp.status}: {body}"
+    except Exception as e:
+        return False, f"Connection error: {str(e).replace(token, '***')}"
+    finally:
+        conn.close()
+
 # ----------------------------------------------------- times & cron job ----
 def parse_times(text):
     """'03:00, 15:30' -> (['03:00','15:30'], None). Returns (None, bad_token) on error."""
-    trans = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
-    text = (text or "").translate(trans).replace("،", ",").replace("؛", ",")
+    text = (text or "").translate(_FA_TO_EN).replace("،", ",").replace("؛", ",")
     tokens = [t for t in re.split(r"[,\s;]+", text.strip()) if t]
     if not tokens:
         return None, "empty"
@@ -1433,7 +1556,14 @@ def parse_times(text):
         return None, "max 24 times"
     return sorted(found), None
 
-def build_cron_text(times):
+def to_server_hm(hhmm, tz):
+    """Convert 'HH:MM' in the chosen time zone to the server's local hour/minute (cron uses server time)."""
+    hour, minute = (int(x) for x in hhmm.split(":"))
+    now = datetime.datetime.now(tz)
+    local = datetime.datetime(now.year, now.month, now.day, hour, minute, tzinfo=tz).astimezone()
+    return local.hour, local.minute
+
+def build_cron_text(times, tz=None):
     py = shutil.which("python3") or sys.executable
     lines = [
         "# Managed by teperbk. Change it from the teperbk menu or the Telegram bot.",
@@ -1441,11 +1571,11 @@ def build_cron_text(times):
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     ]
     for t in times:
-        hour, minute = t.split(":")
-        lines.append(f"{int(minute)} {int(hour)} * * * root {shlex.quote(py)} {shlex.quote(INSTALL_PATH)} --cron-backup >> {LOG_FILE} 2>&1")
+        hour, minute = to_server_hm(t, tz) if tz else tuple(int(x) for x in t.split(":"))
+        lines.append(f"{minute} {hour} * * * root {shlex.quote(py)} {shlex.quote(INSTALL_PATH)} --cron-backup >> {LOG_FILE} 2>&1")
     return "\n".join(lines) + "\n"
 
-def write_cron(times):
+def write_cron(times, tz=None):
     try:
         if not times:
             if os.path.exists(CRON_FILE):
@@ -1453,18 +1583,34 @@ def write_cron(times):
             return True, None
         os.makedirs(os.path.dirname(CRON_FILE), exist_ok=True)
         with open(CRON_FILE, "w") as f:
-            f.write(build_cron_text(times))
+            f.write(build_cron_text(times, tz))
         os.chmod(CRON_FILE, 0o644)
         return True, None
     except OSError as e:
         return False, str(e)
 
+def sync_cron_if_needed(cfg):
+    """Keeps the cron file correct (e.g. after a daylight-saving change or an accidental delete)."""
+    times = cfg.get("times") or []
+    if not times:
+        return
+    wanted = build_cron_text(times, user_tz(cfg))
+    try:
+        with open(CRON_FILE) as f:
+            if f.read() == wanted:
+                return
+    except OSError:
+        pass
+    write_cron(times, user_tz(cfg))
+
 def apply_schedule(times):
-    """Save the times and rewrite the cron job. Returns (ok, error)."""
-    cfg = load_config()
-    cfg["times"] = times
-    save_config(cfg)
-    return write_cron(times)
+    """Save the daily times and rewrite the cron job. Returns (ok, error)."""
+    cfg = update_config(lambda c: c.__setitem__("times", times))
+    return write_cron(times, user_tz(cfg))
+
+def apply_timezone(name):
+    cfg = update_config(lambda c: c.__setitem__("tz", name))
+    return write_cron(cfg.get("times") or [], user_tz(cfg))
 
 def ensure_cron_installed():
     if shutil.which("cron") or shutil.which("crond"):
@@ -1482,6 +1628,16 @@ def ensure_installed_copy():
         shutil.copy2(here, INSTALL_PATH)
     os.chmod(INSTALL_PATH, 0o755)
     return INSTALL_PATH
+
+def ensure_wrapper():
+    if os.path.exists(WRAPPER_PATH):
+        return
+    try:
+        with open(WRAPPER_PATH, "w") as f:
+            f.write(f"#!/bin/bash\ncd /root && exec python3 {INSTALL_PATH} \"$@\"\n")
+        os.chmod(WRAPPER_PATH, 0o755)
+    except OSError:
+        pass
 
 def install_logrotate():
     try:
@@ -1527,7 +1683,7 @@ def activate_schedule(cfg):
     ensure_installed_copy()
     ensure_cron_installed()
     save_config(cfg)
-    ok_cron, err = write_cron(cfg["times"])
+    ok_cron, err = write_cron(cfg["times"], user_tz(cfg))
     install_logrotate()
     ok_service = install_bot_service()
     return ok_cron, err, ok_service
@@ -1566,22 +1722,30 @@ def prune_old_backups(keep_path):
                 pass
     return removed
 
-def split_file(path, part_bytes=None):
-    part_bytes = part_bytes or TG_PART_BYTES
+def split_file(path, part_bytes):
+    """Split a file into parts without loading it into memory."""
     parts_dir = tempfile.mkdtemp(prefix="teperbk_parts_")
     base = os.path.basename(path)
     parts = []
     with open(path, "rb") as src:
         index = 1
         while True:
-            chunk = src.read(part_bytes)
-            if not chunk:
-                break
             part_path = os.path.join(parts_dir, f"{base}.part{index:03d}")
+            written = 0
             with open(part_path, "wb") as out:
-                out.write(chunk)
+                while written < part_bytes:
+                    chunk = src.read(min(8 * MB, part_bytes - written))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+            if written == 0:
+                os.remove(part_path)
+                break
             parts.append(part_path)
             index += 1
+            if written < part_bytes:
+                break
     return parts_dir, parts
 
 def _send_with_retry(token, chat_id, path, caption, attempts=3):
@@ -1597,14 +1761,15 @@ def _send_with_retry(token, chat_id, path, caption, attempts=3):
 
 def send_backup_to_telegram(cfg, zip_path, db_type):
     token, chat_id, lang = cfg["bot_token"], cfg["admin_chat_id"], cfg.get("lang", "fa")
+    max_bytes, part_bytes = tg_limits(cfg)
     size = os.path.getsize(zip_path)
-    caption = bot_t(lang, "caption", host=socket.gethostname(), db=db_type, size=human_size(size),
-                    time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
-    if size <= TG_MAX_BYTES:
+    caption = bot_t(lang, "caption", host=socket.gethostname(), db=db_type,
+                    size=human_size(size), time=fmt_dt(time.time(), cfg))
+    if size <= max_bytes:
         return _send_with_retry(token, chat_id, zip_path, caption)
 
-    print_info(f"Backup is {human_size(size)} (> Telegram 50 MB limit). Sending in parts...")
-    parts_dir, parts = split_file(zip_path)
+    print_info(f"Backup is {human_size(size)} (> {human_size(max_bytes)} limit). Sending in parts...")
+    parts_dir, parts = split_file(zip_path, part_bytes)
     try:
         name = os.path.basename(zip_path)
         for i, part in enumerate(parts, 1):
@@ -1617,14 +1782,14 @@ def send_backup_to_telegram(cfg, zip_path, db_type):
         shutil.rmtree(parts_dir, ignore_errors=True)
 
 def record_last_backup(ok, zip_path=None):
-    cfg = load_config()   # reload: the schedule may have changed while we were working
-    cfg["last_backup"] = {
-        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "ok": bool(ok),
-        "file": os.path.basename(zip_path) if zip_path else "",
-        "size": os.path.getsize(zip_path) if zip_path and os.path.exists(zip_path) else 0,
-    }
-    save_config(cfg)
+    def mutate(cfg):
+        cfg["last_backup"] = {
+            "ts": time.time(),
+            "ok": bool(ok),
+            "file": os.path.basename(zip_path) if zip_path else "",
+            "size": os.path.getsize(zip_path) if zip_path and os.path.exists(zip_path) else 0,
+        }
+    update_config(mutate)
 
 def run_scheduled_backup(trigger="cron"):
     """Backup (no downtime) -> keep only the newest ZIP on the server -> send to Telegram."""
@@ -1684,6 +1849,8 @@ def bot_sched_keyboard(lang):
     for key, times in SCHEDULE_PRESETS.items():
         rows.append([{"text": f"🕒 {key}x/day  ({', '.join(times)})", "callback_data": f"preset:{key}"}])
     rows.append([{"text": bot_t(lang, "b_custom"), "callback_data": "custom"}])
+    rows.append([{"text": bot_t(lang, "b_once"), "callback_data": "once"}])
+    rows.append([{"text": bot_t(lang, "b_once_cancel"), "callback_data": "oncecancel"}])
     rows.append([{"text": bot_t(lang, "b_back"), "callback_data": "menu"}])
     return rows
 
@@ -1692,7 +1859,8 @@ def bot_status_text(cfg):
     last = cfg.get("last_backup")
     if last:
         mark = "✅" if last.get("ok") else "❌"
-        last_txt = f"{last.get('time', '?')} {mark} ({human_size(last.get('size', 0))})"
+        when = fmt_dt(last["ts"], cfg) if last.get("ts") else last.get("time", "?")
+        last_txt = f"{when} {mark} ({human_size(last.get('size', 0))})"
     else:
         last_txt = bot_t(lang, "last_none")
     kept = bot_t(lang, "file_none")
@@ -1703,17 +1871,30 @@ def bot_status_text(cfg):
     except OSError:
         pass
     cron = bot_t(lang, "on") if os.path.exists(CRON_FILE) else bot_t(lang, "off")
+    once = ", ".join(fmt_dt(o["ts"], cfg) for o in sorted(cfg.get("one_time") or [], key=lambda o: o["ts"])) or "-"
+    limit = human_size(tg_limits(cfg)[0]).replace(".0 ", " ")
     return bot_t(lang, "status", host=socket.gethostname(), times=", ".join(cfg.get("times") or []) or "-",
-                 tz=server_timezone(), last=last_txt, file=kept, cron=cron)
+                 tz=tz_label(cfg), once=once, last=last_txt, file=kept, cron=cron, limit=limit)
 
 def bot_set_times(cfg, times):
     lang = cfg.get("lang", "fa")
     ok, err = apply_schedule(times)
     if ok:
-        tg_send(cfg, bot_t(lang, "times_ok", times=", ".join(times), tz=server_timezone()),
+        tg_send(cfg, bot_t(lang, "times_ok", times=", ".join(times), tz=tz_label(cfg)),
                 [[{"text": bot_t(lang, "b_back"), "callback_data": "menu"}]])
     else:
         tg_send(cfg, bot_t(lang, "cron_fail", err=err))
+
+def bot_add_once(cfg, ts):
+    lang = cfg.get("lang", "fa")
+    if ts <= time.time():
+        tg_send(cfg, bot_t(lang, "once_past"))
+        return False
+    update_config(lambda c: c.__setitem__("one_time", sorted(
+        [o for o in (c.get("one_time") or []) if o["ts"] != ts] + [{"ts": ts}], key=lambda o: o["ts"])))
+    tg_send(cfg, bot_t(lang, "once_ok", when=fmt_dt(ts, cfg), tz=tz_label(cfg)),
+            [[{"text": bot_t(lang, "b_back"), "callback_data": "menu"}]])
+    return True
 
 def bot_run_backup_thread(cfg):
     lang = cfg.get("lang", "fa")
@@ -1725,23 +1906,30 @@ def bot_run_backup_thread(cfg):
 
 def bot_action(cfg, action):
     lang = cfg.get("lang", "fa")
+    admin = str(cfg["admin_chat_id"])
     if action == "backup":
         bot_run_backup_thread(cfg)
     elif action == "status":
         tg_send(cfg, bot_status_text(cfg), bot_menu_keyboard(lang))
     elif action == "sched":
-        tg_send(cfg, bot_t(lang, "sched_title") + f"\n🕒 {server_timezone()}", bot_sched_keyboard(lang))
+        tg_send(cfg, bot_t(lang, "sched_title", tz=tz_label(cfg)), bot_sched_keyboard(lang))
     elif action.startswith("preset:"):
         times = SCHEDULE_PRESETS.get(action.split(":", 1)[1])
         if times:
             bot_set_times(cfg, times)
     elif action == "custom":
-        BOT_AWAITING[str(cfg["admin_chat_id"])] = "times"
+        BOT_AWAITING[admin] = "times"
         tg_send(cfg, bot_t(lang, "ask_times"))
+    elif action == "once":
+        BOT_AWAITING[admin] = "once"
+        tg_send(cfg, bot_t(lang, "ask_once", tz=tz_label(cfg)))
+    elif action == "oncecancel":
+        count = len(cfg.get("one_time") or [])
+        update_config(lambda c: c.__setitem__("one_time", []))
+        tg_send(cfg, bot_t(lang, "once_cancelled", n=count), bot_menu_keyboard(lang))
     elif action == "lang":
         new_lang = "en" if lang == "fa" else "fa"
-        cfg["lang"] = new_lang
-        save_config(cfg)
+        cfg = update_config(lambda c: c.__setitem__("lang", new_lang))
         tg_send(cfg, bot_t(new_lang, "lang_set"))
         tg_send(cfg, bot_t(new_lang, "menu"), bot_menu_keyboard(new_lang))
     else:   # "menu" and anything unknown
@@ -1771,6 +1959,7 @@ def bot_handle_update(upd):
     if not text:
         return
     cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+    arg = text.split(None, 1)[1] if len(text.split(None, 1)) == 2 else ""
 
     if cmd == "/cancel":
         BOT_AWAITING.pop(admin, None)
@@ -1784,12 +1973,25 @@ def bot_handle_update(upd):
         bot_action(cfg, "status")
     elif cmd in ("/schedule", "/times"):
         bot_action(cfg, "sched")
-    elif cmd == "/settimes" and len(text.split(None, 1)) == 2:
-        times, err = parse_times(text.split(None, 1)[1])
+    elif cmd == "/settimes" and arg:
+        times, err = parse_times(arg)
         if times:
             bot_set_times(cfg, times)
         else:
             tg_send(cfg, bot_t(lang, "times_bad", err=err))
+    elif cmd == "/once" and arg:
+        ts, err = parse_datetime_input(arg, user_tz(cfg))
+        if ts:
+            bot_add_once(cfg, ts)
+        else:
+            tg_send(cfg, bot_t(lang, "once_bad"))
+    elif cmd == "/settz":
+        name = normalize_tz_name(arg) if arg else None
+        if name is None:
+            tg_send(cfg, bot_t(lang, "tz_bad"))
+        else:
+            ok, _ = apply_timezone(name)
+            tg_send(cfg, bot_t(lang, "tz_ok", tz=tz_label(load_config())))
     elif BOT_AWAITING.get(admin) == "times" and not cmd:
         times, err = parse_times(text)
         if times:
@@ -1797,8 +1999,46 @@ def bot_handle_update(upd):
             bot_set_times(cfg, times)
         else:
             tg_send(cfg, bot_t(lang, "times_bad", err=err))
+    elif BOT_AWAITING.get(admin) == "once" and not cmd:
+        ts, err = parse_datetime_input(text, user_tz(cfg))
+        if ts:
+            BOT_AWAITING.pop(admin, None)
+            bot_add_once(cfg, ts)
+        else:
+            tg_send(cfg, bot_t(lang, "once_bad"))
     else:
         bot_action(cfg, "menu")
+
+def bot_scheduler_loop():
+    """Runs dated one-time backups and keeps the cron file in sync."""
+    last_sync = 0
+    while True:
+        try:
+            cfg = load_config()
+            now = time.time()
+            if now - last_sync > 600:
+                sync_cron_if_needed(cfg)
+                last_sync = now
+            due = [o for o in (cfg.get("one_time") or []) if o["ts"] <= now]
+            if due and is_configured(cfg):
+                due_ts = {o["ts"] for o in due}
+                update_config(lambda c: c.__setitem__("one_time", [o for o in (c.get("one_time") or []) if o["ts"] not in due_ts]))
+                lang = cfg.get("lang", "fa")
+                for o in due:
+                    when = fmt_dt(o["ts"], cfg)
+                    if now - o["ts"] > 1800:
+                        tg_send(cfg, bot_t(lang, "once_missed", when=when))
+                        continue
+                    for _ in range(60):   # wait (max 10 min) if another backup is running
+                        if not backup_is_running():
+                            break
+                        time.sleep(10)
+                    tg_send(cfg, bot_t(lang, "once_run", when=when))
+                    run_scheduled_backup("dated")
+        except Exception as e:
+            print_error(f"Scheduler error: {e}")
+        sys.stdout.flush()
+        time.sleep(20)
 
 def run_bot():
     cfg = load_config()
@@ -1806,7 +2046,7 @@ def run_bot():
         print_error("Telegram bot is not configured. Run 'teperbk' and use the Telegram menu first.")
         sys.exit(1)
     token = cfg["bot_token"]
-    print_info("teperbk Telegram bot started.")
+    print_info(f"teperbk Telegram bot started (v{VERSION}).")
     sys.stdout.flush()
     tg_api(token, "deleteWebhook")
     tg_api(token, "setMyCommands", {"commands": [
@@ -1815,6 +2055,7 @@ def run_bot():
         {"command": "status", "description": "Status"},
         {"command": "schedule", "description": "Backup schedule"},
     ]})
+    threading.Thread(target=bot_scheduler_loop, daemon=True).start()
 
     offset = None
     while True:
@@ -1835,7 +2076,106 @@ def run_bot():
                 print_error(f"Error while handling an update: {e}")
         sys.stdout.flush()
 
-# ----------------------------------------------- terminal menu (option 5) ----
+# ------------------------------------------------ large files (2 GB) mode ----
+def tgm_large_enable():
+    cfg = load_config()
+    if not is_configured(cfg):
+        print_warning("Connect the Telegram bot first.")
+        return
+    if cfg.get("large_files"):
+        print_success("Large file mode is already enabled.")
+        return
+    if not shutil.which("docker"):
+        print_error("Docker is required for this mode.")
+        return
+
+    print_header("Large files (up to 2 GB)")
+    print_info("Telegram's normal bot API accepts only 50 MB per file. To send up to 2 GB, this tool runs")
+    print_info(f"the official Telegram Bot API server in a Docker container ({LOCAL_API_IMAGE}, port 8081 on localhost only).")
+    print_info("You need an api_id and api_hash: log in at https://my.telegram.org -> API development tools.")
+    print_warning("Your bot will be logged out from the normal Telegram server and moved to the local one.")
+    print_warning("Moving it back later takes about 10 minutes during which the bot will not respond.")
+    if not ask_yes_no("Continue? (y/n): ", default=False):
+        return
+
+    api_id = input(f"{Colors.CYAN}🆔 api_id: {Colors.RESET}").strip()
+    api_hash = input(f"{Colors.CYAN}🔐 api_hash: {Colors.RESET}").strip()
+    if not api_id.isdigit() or not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
+        print_error("api_id must be a number and api_hash a 32 character hex string.")
+        return
+
+    token = cfg["bot_token"]
+    print_info("Starting the local Bot API server (the first run downloads the image)...")
+    subprocess.run(["docker", "rm", "-f", LOCAL_API_CONTAINER], capture_output=True)
+    run = subprocess.run([
+        "docker", "run", "-d", "--name", LOCAL_API_CONTAINER, "--restart", "unless-stopped",
+        "-p", "127.0.0.1:8081:8081",
+        "-e", f"TELEGRAM_API_ID={api_id}", "-e", f"TELEGRAM_API_HASH={api_hash}", "-e", "TELEGRAM_LOCAL=1",
+        "-v", "teperbk-botapi-data:/var/lib/telegram-bot-api",
+        LOCAL_API_IMAGE], capture_output=True, text=True)
+    if run.returncode != 0:
+        print_error(f"Could not start the container: {run.stderr.strip()}")
+        return
+    print_success("Local Bot API server container started.")
+
+    if shutil.which("systemctl"):
+        run_command(f"systemctl stop {SERVICE_NAME}")
+
+    print_info("Logging the bot out from the normal Telegram server...")
+    res = tg_api(token, "logOut", base=CLOUD_API)
+    if res.get("ok"):
+        print_success("Bot logged out from the cloud API.")
+    else:
+        print_warning(f"logOut answered: {res.get('description')} (continuing; it may already be logged out)")
+
+    print_info("Waiting for the local server to accept the bot...")
+    ready = False
+    for _ in range(30):
+        res = tg_api(token, "getMe", base=LOCAL_API)
+        if res.get("ok"):
+            ready = True
+            break
+        time.sleep(3)
+    if not ready:
+        print_error(f"The local server did not accept the bot: {res.get('description')}")
+        print_error(f"Check: docker logs {LOCAL_API_CONTAINER}")
+        print_warning("The bot may need up to 10 minutes before it works again. Run this option again afterwards.")
+        if shutil.which("systemctl"):
+            run_command(f"systemctl start {SERVICE_NAME}")
+        return
+
+    def mutate(c):
+        c.update(large_files=True, api_base=LOCAL_API, api_id=api_id, api_hash=api_hash)
+    cfg = update_config(mutate)
+    if shutil.which("systemctl") and os.path.exists(SERVICE_FILE):
+        run_command(f"systemctl start {SERVICE_NAME}")
+    res = tg_send(cfg, "✅ Large file mode enabled (up to 2 GB).")
+    print_success("Large file mode enabled. Backups up to ~1.9 GB are sent as a single file.")
+    if not res.get("ok"):
+        print_warning(f"Test message failed: {res.get('description')}")
+
+def tgm_large_disable():
+    cfg = load_config()
+    if not cfg.get("large_files"):
+        print_info("Large file mode is not enabled.")
+        return
+    print_warning("The bot will be moved back to the normal Telegram server. It will not respond for about 10 minutes.")
+    if not ask_yes_no("Continue? (y/n): ", default=False):
+        return
+    token = cfg["bot_token"]
+    if shutil.which("systemctl"):
+        run_command(f"systemctl stop {SERVICE_NAME}")
+    res = tg_api(token, "logOut", base=cfg.get("api_base") or LOCAL_API)
+    if not res.get("ok"):
+        print_warning(f"logOut answered: {res.get('description')}")
+    subprocess.run(["docker", "rm", "-f", LOCAL_API_CONTAINER], capture_output=True)
+    update_config(lambda c: c.update(large_files=False, api_base=""))
+    if shutil.which("systemctl") and os.path.exists(SERVICE_FILE):
+        run_command(f"systemctl start {SERVICE_NAME}")
+    print_success("Back to the normal Telegram server (50 MB per file; bigger backups are sent in parts).")
+    print_warning("Give it about 10 minutes before the bot answers again.")
+
+# ----------------------------------------------- terminal menu (option 4) ----
 def _tgm_ask_token():
     while True:
         token = input(f"{Colors.CYAN}🔑 Enter Telegram Bot Token (from @BotFather): {Colors.RESET}").strip()
@@ -1854,8 +2194,17 @@ def _tgm_ask_chat_id():
             return chat_id
         print_error("Chat ID must be a number.")
 
-def _tgm_ask_times(default):
-    print_info(f"Server time zone: {server_timezone()}")
+def _tgm_ask_tz(default):
+    print_info("Time zone for backup hours and dates (examples: Asia/Tehran, Europe/Berlin, UTC, or 'local' for the server time).")
+    while True:
+        raw = input(f"{Colors.CYAN}🕒 Time zone [{default or 'local'}]: {Colors.RESET}").strip()
+        name = normalize_tz_name(raw if raw else (default or "local"))
+        if name is not None:
+            return name
+        print_error("Unknown time zone.")
+
+def _tgm_ask_times(default, cfg):
+    print_info(f"Time zone: {tz_label(cfg)}  |  Server time zone: {server_timezone()}")
     print_info("Enter the daily backup times (24h), separated by comma or space. Example: 03:00, 15:30")
     print_info("One time = once a day, three times = three backups per day.")
     while True:
@@ -1871,12 +2220,17 @@ def tgm_setup():
     print_header("Connect Telegram Bot")
     print_info("Create a bot with @BotFather, press START in your new bot, and get your numeric ID from @userinfobot.")
     cfg = load_config()
+    old_token = cfg.get("bot_token")
     cfg["bot_token"] = _tgm_ask_token()
     cfg["admin_chat_id"] = _tgm_ask_chat_id()
+    if old_token and old_token != cfg["bot_token"] and cfg.get("large_files"):
+        print_warning("A different bot was entered: large file mode was switched off for it.")
+        cfg.update(large_files=False, api_base="")
 
     lang_choice = input(f"{Colors.CYAN}🌐 Bot language (1 = فارسی, 2 = English) [1]: {Colors.RESET}").strip()
     cfg["lang"] = "en" if lang_choice == "2" else "fa"
-    cfg["times"] = _tgm_ask_times(cfg.get("times") or ["03:00"])
+    cfg["tz"] = _tgm_ask_tz(cfg.get("tz", "Asia/Tehran"))
+    cfg["times"] = _tgm_ask_times(cfg.get("times") or ["03:00"], cfg)
 
     res = tg_send(cfg, bot_t(cfg["lang"], "menu"), bot_menu_keyboard(cfg["lang"]))
     if not res.get("ok"):
@@ -1895,36 +2249,61 @@ def tgm_setup():
         print_error(f"Could not write the cron job: {err}")
     if ok_service:
         print_success(f"Bot service is running ({SERVICE_NAME}).")
-    print_success(f"Daily backups at: {', '.join(cfg['times'])}  [{server_timezone()}]")
+    print_success(f"Daily backups at: {', '.join(cfg['times'])}  [{tz_label(cfg)}]")
     print_info(f"Only the latest backup is kept in {BACKUP_DIR}. Logs: {LOG_FILE}")
+
+    if not cfg.get("large_files"):
+        print("")
+        print_info("How should big backups (over 50 MB) be sent?")
+        print_info("  No  = normal mode, no API needed. Big backups are split into 45 MB parts. (default)")
+        print_info("  Yes = single file up to 2 GB. Needs an api_id/api_hash from my.telegram.org and Docker.")
+        if ask_yes_no("Enable large file mode (up to 2 GB) now? (y/n) [n]: ", default=False):
+            tgm_large_enable()
+        else:
+            print_info("OK, normal mode. You can switch later: teperbk -> 4 -> 5.")
 
 def tgm_set_times():
     cfg = load_config()
     if not is_configured(cfg):
         print_warning("Connect the Telegram bot first.")
         return
-    times = _tgm_ask_times(cfg.get("times") or ["03:00"])
+    times = _tgm_ask_times(cfg.get("times") or ["03:00"], cfg)
     ensure_installed_copy()
     ok, err = apply_schedule(times)
     if ok:
-        print_success(f"Schedule saved: {', '.join(times)}  [{server_timezone()}]")
+        print_success(f"Schedule saved: {', '.join(times)}  [{tz_label(cfg)}]")
         print_success("Cron job updated.")
     else:
         print_error(f"Could not write the cron job: {err}")
+
+def tgm_set_timezone():
+    cfg = load_config()
+    if not is_configured(cfg):
+        print_warning("Connect the Telegram bot first.")
+        return
+    name = _tgm_ask_tz(cfg.get("tz", ""))
+    ok, err = apply_timezone(name)
+    print_success(f"Time zone set to {tz_label(load_config())}.") if ok else print_error(f"Could not update the cron job: {err}")
 
 def tgm_status():
     cfg = load_config()
     token = cfg.get("bot_token", "")
     masked = (token[:6] + "..." + token[-4:]) if len(token) > 12 else ("(not set)" if not token else "***")
+    print(f"  Version       : {VERSION}")
     print(f"  Bot token     : {masked}")
     print(f"  Admin chat ID : {cfg.get('admin_chat_id') or '(not set)'}")
     print(f"  Language      : {cfg.get('lang')}")
-    print(f"  Daily times   : {', '.join(cfg.get('times') or []) or '-'}  [{server_timezone()}]")
+    print(f"  Time zone     : {tz_label(cfg)}  (server: {server_timezone()})")
+    print(f"  Daily times   : {', '.join(cfg.get('times') or []) or '-'}")
+    once = ", ".join(fmt_dt(o["ts"], cfg) for o in sorted(cfg.get("one_time") or [], key=lambda o: o["ts"])) or "-"
+    print(f"  Dated backups : {once}")
     print(f"  Cron job      : {'present' if os.path.exists(CRON_FILE) else 'MISSING'}  ({CRON_FILE})")
     print(f"  Bot service   : {bot_service_state()}")
+    print(f"  Large files   : {'ON (up to 2 GB, local Bot API server)' if cfg.get('large_files') else 'off (50 MB limit, bigger backups are sent in parts)'}")
     last = cfg.get("last_backup")
     if last:
-        print(f"  Last backup   : {last.get('time')}  {'OK' if last.get('ok') else 'FAILED'}  {human_size(last.get('size', 0))}")
+        when = fmt_dt(last["ts"], cfg) if last.get("ts") else last.get("time", "?")
+        print(f"  Last backup   : {when}  {'OK' if last.get('ok') else 'FAILED'}  {human_size(last.get('size', 0))}")
     else:
         print("  Last backup   : none yet")
     try:
@@ -1947,6 +2326,8 @@ def tgm_disable():
     if shutil.which("systemctl"):
         run_command("systemctl daemon-reload")
     print_success("Cron job removed and bot service stopped.")
+    if load_config().get("large_files"):
+        print_warning(f"Large file mode is still on (container '{LOCAL_API_CONTAINER}'). Use the 'Large files' option to switch it off properly.")
     if ask_yes_no("Also delete the saved bot token and settings? (y/n): ", default=False):
         try:
             os.remove(CONFIG_FILE)
@@ -1959,59 +2340,121 @@ def workflow_telegram_manager():
         print_header("Telegram Bot & Daily Backup Schedule")
         cfg = load_config()
         if is_configured(cfg):
-            print_info(f"Daily times: {', '.join(cfg.get('times') or [])}  [{server_timezone()}]")
+            print_info(f"Daily times: {', '.join(cfg.get('times') or [])}  [{tz_label(cfg)}]")
+            print_info("Large files: " + ("ON (up to 2 GB)" if cfg.get("large_files") else "off (50 MB, bigger backups are split)"))
         else:
             print_warning("Not connected yet. Start with option 1.")
         print(f"\n{Colors.BLUE}1-{Colors.RESET} 🔗 Connect / change Telegram bot (+ auto create cron job)")
         print(f"{Colors.BLUE}2-{Colors.RESET} ⏰ Change daily backup times")
-        print(f"{Colors.BLUE}3-{Colors.RESET} 📦 Run a backup now and send it to Telegram")
-        print(f"{Colors.BLUE}4-{Colors.RESET} 📊 Show status")
-        print(f"{Colors.BLUE}5-{Colors.RESET} 🗑️  Disable (remove cron job & stop bot)")
-        print(f"{Colors.RED}6-{Colors.RESET} ⬅️  Back to main menu")
-        choice = input(f"\n{Colors.CYAN}👉 Select an option (1-6): {Colors.RESET}").strip()
+        print(f"{Colors.BLUE}3-{Colors.RESET} 🕒 Change time zone")
+        print(f"{Colors.BLUE}4-{Colors.RESET} 📦 Run a backup now and send it to Telegram")
+        print(f"{Colors.BLUE}5-{Colors.RESET} 🗄️  Large files up to 2 GB (enable / disable)")
+        print(f"{Colors.BLUE}6-{Colors.RESET} 📊 Show status")
+        print(f"{Colors.BLUE}7-{Colors.RESET} 🗑️  Disable (remove cron job & stop bot)")
+        print(f"{Colors.RED}8-{Colors.RESET} ⬅️  Back to main menu")
+        choice = input(f"\n{Colors.CYAN}👉 Select an option (1-8): {Colors.RESET}").strip()
 
         if choice == "1":
             tgm_setup()
         elif choice == "2":
             tgm_set_times()
         elif choice == "3":
+            tgm_set_timezone()
+        elif choice == "4":
             if not is_configured(cfg):
                 print_warning("Connect the Telegram bot first.")
             else:
                 run_scheduled_backup("manual")
-        elif choice == "4":
-            tgm_status()
         elif choice == "5":
-            tgm_disable()
+            tgm_large_disable() if cfg.get("large_files") else tgm_large_enable()
         elif choice == "6":
+            tgm_status()
+        elif choice == "7":
+            tgm_disable()
+        elif choice == "8":
             return
         else:
             print_error("Invalid option!")
         input(f"\n{Colors.YELLOW}Press [ENTER] to continue...{Colors.RESET}")
 
+# ------------------------------------------------------------- update ----
+def workflow_update(auto=False):
+    """Download the latest teperbk.py from GitHub. Returns 'updated', 'same' or False."""
+    print_header("Update teperbk")
+    print_info(f"Current version: {VERSION}")
+    try:
+        req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "teperbk-updater"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+    except Exception as e:
+        print_error(f"Could not download the latest version: {e}")
+        return False
+
+    try:
+        text = data.decode("utf-8")
+        compile(text, "teperbk.py", "exec")
+        if "def main(" not in text or "teperbk" not in text:
+            raise ValueError("this does not look like teperbk")
+    except Exception as e:
+        print_error(f"The downloaded file is not valid, update cancelled: {e}")
+        return False
+
+    m = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M)
+    new_version = m.group(1) if m else "unknown"
+
+    current_path = INSTALL_PATH if os.path.exists(INSTALL_PATH) else os.path.abspath(__file__)
+    try:
+        with open(current_path, "rb") as f:
+            if f.read() == data:
+                print_success("You already have the latest version.")
+                return "same"
+    except OSError:
+        pass
+
+    print_info(f"Latest version on GitHub: {new_version}")
+    if not auto and not ask_yes_no(f"Update {VERSION} -> {new_version}? (y/n): ", default=True):
+        return False
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    if os.path.exists(INSTALL_PATH):
+        shutil.copy2(INSTALL_PATH, INSTALL_PATH + ".bak")
+    tmp = INSTALL_PATH + ".new"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, INSTALL_PATH)
+    ensure_wrapper()
+
+    if os.path.exists(SERVICE_FILE) and shutil.which("systemctl"):
+        run_command(f"systemctl restart {SERVICE_NAME}")
+        print_success("Telegram bot service restarted with the new version.")
+    print_success(f"Updated to version {new_version}. The previous version is kept as {INSTALL_PATH}.bak")
+    print_info("Run 'teperbk' again to use the new version.")
+    return "updated"
+
 
 def main():
     while True:
         os.system('cls' if os.name == 'nt' else 'clear')
-        
+
         print(f"\n{Colors.HEADER}{Colors.BOLD}=================================================={Colors.RESET}")
         print(f"{Colors.HEADER}{Colors.BOLD}          🛡️  PASARGUARD MANAGER UTILITY 🛡️           {Colors.RESET}")
         print(f"{Colors.HEADER}{Colors.BOLD}=================================================={Colors.RESET}")
-        print(f"{Colors.CYAN}       Dev by: jyavaz{Colors.RESET}")
+        print(f"{Colors.CYAN}       Dev by: jyavaz   |   Version: {VERSION}{Colors.RESET}")
         print(f"{Colors.CYAN}       GitHub: https://github.com/jyavaz68/{Colors.RESET}")
         print(f"{Colors.HEADER}{Colors.BOLD}=================================================={Colors.RESET}\n")
         print(f"{Colors.BLUE}1-{Colors.RESET} 🚀 Auto Backup & Transfer to New Server")
-        print(f"{Colors.BLUE}2-{Colors.RESET} 🤖 Auto Backup to Telegram Bot (Scheduled)")
-        print(f"{Colors.BLUE}3-{Colors.RESET} 💾 Manual Backup (Save locally)")
-        print(f"{Colors.BLUE}4-{Colors.RESET} 🔄 Manual Restore (From local zip)")
-        print(f"{Colors.BLUE}5-{Colors.RESET} ⏰ Telegram Bot & Daily Schedule (cron job, recommended)")
+        print(f"{Colors.BLUE}2-{Colors.RESET} 💾 Manual Backup (Save locally)")
+        print(f"{Colors.BLUE}3-{Colors.RESET} 🔄 Manual Restore (From local zip)")
+        print(f"{Colors.BLUE}4-{Colors.RESET} ⏰ Telegram Bot & Daily Schedule (cron job)")
+        print(f"{Colors.BLUE}5-{Colors.RESET} ⬆️  Update (get the latest version from GitHub)")
         print(f"{Colors.RED}6-{Colors.RESET} 🚪 Exit")
         print(f"{Colors.HEADER}--------------------------------------------------{Colors.RESET}")
-        
+
         choice = input(f"{Colors.CYAN}👉 Please select an option (1-6): {Colors.RESET}").strip()
-        
+
         db_type = None
-        if choice in ['1', '2', '3']:
+        if choice in ['1', '2']:
             print("")
             db_type = detect_db_type_local()
             if not db_type:
@@ -2022,16 +2465,18 @@ def main():
             workflow_auto_backup_restore(db_type)
             pause_and_return()
         elif choice == '2':
-            workflow_backup_bot(db_type)
-            pause_and_return()
-        elif choice == '3':
             workflow_manual_backup(db_type)
             pause_and_return()
-        elif choice == '4':
+        elif choice == '3':
             workflow_manual_restore()
             pause_and_return()
-        elif choice == '5':
+        elif choice == '4':
             workflow_telegram_manager()
+        elif choice == '5':
+            result = workflow_update()
+            if result == "updated":
+                sys.exit(0)
+            pause_and_return()
         elif choice == '6':
             print(f"{Colors.YELLOW}🚪 Exiting... Have a great day!{Colors.RESET}")
             sys.exit(0)
@@ -2044,5 +2489,9 @@ if __name__ == "__main__":
         sys.exit(0 if run_scheduled_backup("cron") else 1)
     elif "--bot" in sys.argv:
         run_bot()
+    elif "--update" in sys.argv:
+        sys.exit(0 if workflow_update(auto=True) else 1)
+    elif "--version" in sys.argv:
+        print(VERSION)
     else:
         main()

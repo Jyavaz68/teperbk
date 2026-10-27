@@ -15,7 +15,9 @@ Backup, restore & server migration tool for **PasarGuard** and **PG-Node**.
 - Aborts the backup if the database export fails, so you never end up with an empty backup
 - One-step migration to a new server over SSH
 - **Telegram bot + daily schedule:** pick how many times per day and at what hours, from the terminal or from the bot. The cron job is created and updated automatically, and only the latest backup is kept on the server
-- Scheduled automatic backups sent to a Telegram bot (simple foreground loop, option 2)
+- **Jalali (Shamsi) dates:** plan a one-time backup for an exact Jalali date and time from the bot
+- **Files up to 2 GB** (optional local Bot API server) instead of the 50 MB Telegram bot limit
+- **One-click update** from GitHub (menu option 5 or `teperbk --update`)
 - Manual local backup and restore
 - **Test / Final backup mode:** choose whether services are stopped during the backup
 
@@ -43,27 +45,27 @@ teperbk
 | # | Option | Description |
 |---|--------|-------------|
 | 1 | Auto Backup & Transfer | Backup, optional Telegram send, then restore on a new server via SSH |
-| 2 | Auto Backup to Telegram | Simple loop: backup every X hours while the terminal stays open (never stops services) |
-| 3 | Manual Backup | Save the backup ZIP in the current directory |
-| 4 | Manual Restore | Restore from a local ZIP (wipes the current setup) |
-| 5 | **Telegram Bot & Daily Schedule** | Permanent daily backups with cron + a bot you control from Telegram (recommended) |
+| 2 | Manual Backup | Save the backup ZIP in the current directory |
+| 3 | Manual Restore | Restore from a local ZIP (wipes the current setup) |
+| 4 | **Telegram Bot & Daily Schedule** | Permanent daily backups with cron + a bot you control from Telegram (recommended) |
+| 5 | **Update** | Download the latest version from GitHub |
 | 6 | Exit | |
 
 The database type is **detected automatically**: for backups it reads the services in `/opt/pasarguard/docker-compose.yml`, and for restore it reads the content of the ZIP file. If your panel uses something else (SQLite, MariaDB, plain PostgreSQL), the script tells you it is unsupported and stops.
 
-### Backup mode (options 1 and 3)
+### Backup mode (options 1 and 2)
 The script asks: *Stop Pasarguard & PG-Node during backup?*
 - **n (test):** nothing is stopped, zero downtime. Data may change while the backup runs.
 - **y (final):** the app and the node are stopped (the database stays up for the dump), so no data changes. You can also choose to keep them stopped after the backup, which is what you want for a migration.
 
-Option 2 (scheduled Telegram backup) never stops anything.
+Scheduled Telegram backups (option 4) never stop anything.
 
 ### What is inside the backup
 `docker-compose.yml`, `.env`, the database dump, `/var/lib/pasarguard`, `/opt/pg-node` and `/var/lib/pg-node`.
 
 ---
 
-### Telegram bot & daily scheduled backups (option 5)
+### Telegram bot & daily scheduled backups (option 4)
 
 This is the "set it and forget it" mode. It takes the same full backup as the migration (same ZIP format, so you can restore it on a new server), sends it to your Telegram, and keeps only the **latest** copy on the server.
 
@@ -71,7 +73,7 @@ This is the "set it and forget it" mode. It takes the same full backup as the mi
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
 2. Open your new bot in Telegram and press **START** (a bot cannot message you before that).
 3. Get your numeric ID from [@userinfobot](https://t.me/userinfobot). Use your **own** account ID, not a group.
-4. Run `teperbk`, choose **5**, then **1**, and enter the token, your ID, the bot language and the daily times, for example `03:00, 15:00` (two backups per day).
+4. Run `teperbk`, choose **4**, then **1**, and enter the token, your ID, the bot language, your time zone (default `Asia/Tehran`) and the daily times, for example `03:00, 15:00` (two backups per day).
 
 The script then automatically:
 - creates the cron job in `/etc/cron.d/teperbk`
@@ -86,7 +88,10 @@ Only your admin ID can use the bot. Everyone else is ignored.
 | `/start` | Open the menu |
 | 📦 Backup now (`/backup`) | Take a backup right now and send it |
 | 📊 Status (`/status`) | Shows times, last backup, kept file, cron state |
-| ⏰ Schedule (`/schedule`) | Presets (1x, 2x, 3x, 4x per day) or custom times |
+| ⏰ Schedule (`/schedule`) | Presets (1x, 2x, 3x, 4x per day) or custom daily times |
+| 📅 One-time backup (`/once 1405/08/29 14:30`) | Backup at an exact **Jalali** (or Gregorian) date and time |
+| 🗑 Cancel dated backups | Removes all pending one-time backups |
+| `/settz Asia/Tehran` | Change the time zone used for hours and dates |
 | `/settimes 03:00 15:30` | Set the daily times directly |
 | 🌐 Language | Switch between فارسی and English |
 
@@ -95,12 +100,29 @@ When you change the schedule in the bot (or from the terminal menu), the cron jo
 #### How it behaves
 - **No downtime:** scheduled backups never stop PasarGuard or PG-Node.
 - **Only the latest backup stays on the server** in `/opt/teperbk/backups`. Older ones are deleted only after the new backup was created successfully, so a failed run never leaves you with nothing.
-- **Big backups:** Telegram bots can upload files up to 50 MB. Bigger backups are sent automatically in 45 MB parts. Join them on the server with `cat backup_XXXX.zip.part* > backup_XXXX.zip`.
-- **Time zone:** the hours are in the **server's time zone** (the bot and the script show it).
+- **Time zone:** all hours and dates use the time zone you chose (default `Asia/Tehran`), even if the server is in another country. The script converts the hours for cron automatically and re-checks them regularly (for example after a daylight-saving change on the server).
+- **Jalali dates:** with the Persian bot language, dates in messages are shown in the Jalali calendar. A one-time backup runs only if the bot service was online at that time. If it was offline for more than 30 minutes, the backup is skipped and you get a message.
+- **Big backups:** the normal Telegram bot API accepts files up to 50 MB, so bigger backups are sent in 45 MB parts (join them with `cat backup_XXXX.zip.part* > backup_XXXX.zip`). To send a single file up to 2 GB, see *Large files* below.
 - **Overlap protection:** if a backup is already running, a second one is skipped.
 - **Failures:** if a backup or the upload fails, the bot sends you a message. Details are in `/var/log/teperbk.log` (rotated weekly).
 - **Files:** settings (bot token, times) are stored in `/opt/teperbk/config.json` with permission `600`.
-- **Remove everything:** `teperbk` → 5 → 5 removes the cron job and stops the bot service.
+- **Remove everything:** `teperbk` → 4 → 7 removes the cron job and stops the bot service.
+
+#### Large files up to 2 GB (optional)
+You choose: **without API** (default, nothing to set up, big backups are split into 45 MB parts) or **with API** (single file up to 2 GB). The script asks you during the Telegram setup, and you can switch any time from `teperbk` → **4** → **5**.
+
+Telegram's normal bot API limits uploads to 50 MB. To send up to 2 GB in one file, the script can run the official **Telegram Bot API server** in a Docker container on your server (`aiogram/telegram-bot-api`, listening on `127.0.0.1:8081` only).
+
+1. Get an `api_id` and `api_hash` at [my.telegram.org](https://my.telegram.org) → *API development tools*.
+2. Run `teperbk` → **4** → **5** and enter them. The script starts the container, logs your bot out of the normal Telegram server and switches the bot to the local one.
+3. To go back: the same menu item switches it off. After that, the bot needs about **10 minutes** before it answers again (a Telegram rule when moving a bot between servers).
+
+Notes: the container image is a third-party image from Docker Hub, and it handles your bot token, so use it only if you trust it. This mode is optional and off by default. If anything fails, normal 50 MB mode with split parts keeps working.
+
+---
+
+### Updating
+Run `teperbk` → **5** (or `teperbk --update`). The script downloads the latest `teperbk.py` from GitHub, checks that it is valid Python, keeps the old file as `/opt/teperbk/teperbk.py.bak`, installs the new one and restarts the Telegram bot service if it is installed. Your settings are not touched.
 
 ---
 
@@ -258,7 +280,9 @@ docker ps
 - اگر خروجی گرفتن از دیتابیس خطا بدهد، بکاپ متوقف می‌شود تا بکاپ خالی نگیری
 - انتقال یک‌مرحله‌ای به سرور جدید از طریق SSH
 - **ربات تلگرام + زمان‌بندی روزانه:** انتخاب اینکه روزی چند بار و چه ساعتی بکاپ بفرستد، هم از ترمینال و هم از داخل ربات. کرون‌جاب خودکار ساخته و به‌روز می‌شود و روی سرور فقط آخرین بکاپ می‌ماند
-- بکاپ زمان‌بندی‌شده ساده و ارسال به تلگرام (حلقه ساده در ترمینال، گزینه ۲)
+- **تاریخ شمسی:** زمان‌بندی یک بکاپ تک‌باره در تاریخ و ساعت دقیق شمسی از داخل ربات
+- **ارسال فایل تا ۲ گیگابایت** (با سرور محلی Bot API، اختیاری) به جای محدودیت ۵۰ مگابایتی ربات‌های تلگرام
+- **آپدیت با یک گزینه** از گیتهاب (گزینه ۵ منو یا `teperbk --update`)
 - بکاپ و ریستور دستی (لوکال)
 - **حالت تست / نهایی:** انتخاب اینکه سرویس‌ها حین بکاپ خاموش بشن یا نه
 
@@ -296,27 +320,27 @@ teperbk
 | # | گزینه | توضیح |
 |---|-------|-------|
 | ۱ | بکاپ و انتقال خودکار | بکاپ، ارسال اختیاری به تلگرام و ریستور روی سرور جدید با SSH |
-| ۲ | بکاپ خودکار به تلگرام | حلقه ساده: هر چند ساعت یک‌بار تا وقتی ترمینال باز است (هرگز سرویس‌ها را خاموش نمی‌کند) |
-| ۳ | بکاپ دستی | ذخیره زیپ بکاپ در پوشه فعلی |
-| ۴ | ریستور دستی | ریستور از زیپ لوکال (تنظیمات فعلی پاک می‌شود) |
-| ۵ | **ربات تلگرام و زمان‌بندی روزانه** | بکاپ دائمی روزانه با کرون‌جاب + رباتی که از تلگرام کنترلش می‌کنی (پیشنهادی) |
+| ۲ | بکاپ دستی | ذخیره زیپ بکاپ در پوشه فعلی |
+| ۳ | ریستور دستی | ریستور از زیپ لوکال (تنظیمات فعلی پاک می‌شود) |
+| ۴ | **ربات تلگرام و زمان‌بندی روزانه** | بکاپ دائمی روزانه با کرون‌جاب + رباتی که از تلگرام کنترلش می‌کنی (پیشنهادی) |
+| ۵ | **آپدیت** | دانلود آخرین نسخه از گیتهاب |
 | ۶ | خروج | |
 
 نوع دیتابیس **خودکار تشخیص داده می‌شود**: برای بکاپ از سرویس‌های `/opt/pasarguard/docker-compose.yml` و برای ریستور از محتوای فایل ZIP. اگر پنل تو از چیز دیگری استفاده می‌کند (SQLite، MariaDB یا PostgreSQL ساده)، اسکریپت می‌گوید پشتیبانی نمی‌شود و متوقف می‌شود.
 
-### حالت بکاپ (گزینه‌های ۱ و ۳)
+### حالت بکاپ (گزینه‌های ۱ و ۲)
 اسکریپت می‌پرسد: *Stop Pasarguard & PG-Node during backup?*
 - **n (تست):** هیچ‌چیز خاموش نمی‌شود و قطعی ندارد. ممکن است داده حین بکاپ تغییر کند.
 - **y (نهایی):** اپ و نود خاموش می‌شوند (دیتابیس برای دامپ روشن می‌ماند) تا هیچ داده‌ای تغییر نکند. می‌توانی انتخاب کنی بعد از بکاپ هم خاموش بمانند، که برای انتقال همین را می‌خواهی.
 
-گزینه ۲ (بکاپ زمان‌بندی‌شده تلگرام) هیچ‌وقت چیزی را خاموش نمی‌کند.
+بکاپ زمان‌بندی‌شده تلگرام (گزینه ۴) هیچ‌وقت چیزی را خاموش نمی‌کند.
 
 ### داخل بکاپ چیست
 `docker-compose.yml`، `.env`، دامپ دیتابیس، `/var/lib/pasarguard`، `/opt/pg-node` و `/var/lib/pg-node`.
 
 ---
 
-### ربات تلگرام و بکاپ روزانه زمان‌بندی‌شده (گزینه ۵)
+### ربات تلگرام و بکاپ روزانه زمان‌بندی‌شده (گزینه ۴)
 
 این حالت «یک بار تنظیم کن و فراموشش کن» است. دقیقاً همان بکاپ کامل انتقال را می‌گیرد (همان فرمت زیپ، پس روی سرور جدید هم ریستور می‌شود)، برایت در تلگرام می‌فرستد و روی سرور فقط **آخرین** نسخه را نگه می‌دارد.
 
@@ -324,7 +348,7 @@ teperbk
 ۱. با [@BotFather](https://t.me/BotFather) یک ربات بساز و توکنش را کپی کن.
 ۲. ربات جدیدت را در تلگرام باز کن و **START** را بزن (تا این کار را نکنی ربات نمی‌تواند به تو پیام بدهد).
 ۳. آیدی عددی خودت را از [@userinfobot](https://t.me/userinfobot) بگیر. آیدی **حساب خودت** را بده، نه گروه.
-۴. `teperbk` را اجرا کن، گزینه **۵** و بعد **۱** را بزن و توکن، آیدی، زبان ربات و ساعت‌های روزانه را وارد کن، مثلاً `03:00, 15:00` (روزی دو بار).
+۴. `teperbk` را اجرا کن، گزینه **۴** و بعد **۱** را بزن و توکن، آیدی، زبان ربات، منطقه زمانی (پیش‌فرض `Asia/Tehran`) و ساعت‌های روزانه را وارد کن، مثلاً `03:00, 15:00` (روزی دو بار).
 
 بعد از آن اسکریپت خودش این کارها را انجام می‌دهد:
 - ساخت کرون‌جاب در `/etc/cron.d/teperbk`
@@ -339,7 +363,10 @@ teperbk
 | `/start` | باز کردن منو |
 | 📦 بکاپ همین الان (`/backup`) | همین الان بکاپ می‌گیرد و می‌فرستد |
 | 📊 وضعیت (`/status`) | ساعت‌ها، آخرین بکاپ، فایل روی سرور و وضعیت کرون |
-| ⏰ زمان‌بندی (`/schedule`) | گزینه‌های آماده (۱، ۲، ۳ یا ۴ بار در روز) یا ساعت دلخواه |
+| ⏰ زمان‌بندی (`/schedule`) | گزینه‌های آماده (۱، ۲، ۳ یا ۴ بار در روز) یا ساعت‌های روزانه دلخواه |
+| 📅 بکاپ در تاریخ مشخص (`/once 1405/08/29 14:30`) | بکاپ در تاریخ و ساعت دقیق **شمسی** (یا میلادی) |
+| 🗑 لغو بکاپ‌های تاریخ‌دار | همه بکاپ‌های تک‌باره در انتظار را پاک می‌کند |
+| `/settz Asia/Tehran` | تغییر منطقه زمانی ساعت‌ها و تاریخ‌ها |
 | `/settimes 03:00 15:30` | تنظیم مستقیم ساعت‌های روزانه |
 | 🌐 زبان | تغییر بین فارسی و English |
 
@@ -348,12 +375,29 @@ teperbk
 #### رفتار سیستم
 - **بدون قطعی:** بکاپ زمان‌بندی‌شده هیچ‌وقت پاسارگاد و PG-Node را خاموش نمی‌کند.
 - **فقط آخرین بکاپ روی سرور می‌ماند** (در `/opt/teperbk/backups`). نسخه‌های قدیمی فقط بعد از ساخته شدن موفق بکاپ جدید پاک می‌شوند، پس اگر یک اجرا خطا بدهد چیزی را از دست نمی‌دهی.
-- **بکاپ حجیم:** ربات‌های تلگرام تا ۵۰ مگابایت می‌توانند فایل بفرستند. بکاپ بزرگ‌تر خودکار در بخش‌های ۴۵ مگابایتی ارسال می‌شود. روی سرور با `cat backup_XXXX.zip.part* > backup_XXXX.zip` به هم وصلشان کن.
-- **منطقه زمانی:** ساعت‌ها بر اساس **منطقه زمانی سرور** هستند (ربات و اسکریپت آن را نشان می‌دهند).
+- **منطقه زمانی:** همه ساعت‌ها و تاریخ‌ها بر اساس منطقه زمانی انتخابی تو هستند (پیش‌فرض `Asia/Tehran`)، حتی اگر سرور در کشور دیگری باشد. اسکریپت ساعت‌ها را خودکار برای کرون تبدیل می‌کند و مرتب دوباره چک می‌کند (مثلاً بعد از تغییر ساعت تابستانی سرور).
+- **تاریخ شمسی:** وقتی زبان ربات فارسی است، تاریخ‌ها در پیام‌ها شمسی نمایش داده می‌شوند. بکاپ تک‌باره فقط وقتی اجرا می‌شود که سرویس ربات در آن زمان روشن باشد. اگر بیشتر از ۳۰ دقیقه خاموش بوده باشد، آن بکاپ رد می‌شود و پیام می‌گیری.
+- **بکاپ حجیم:** ربات معمولی تلگرام فقط تا ۵۰ مگابایت فایل می‌پذیرد، پس بکاپ بزرگ‌تر در بخش‌های ۴۵ مگابایتی ارسال می‌شود (با `cat backup_XXXX.zip.part* > backup_XXXX.zip` به هم وصلشان کن). برای ارسال یک فایل تا ۲ گیگابایت بخش *فایل حجیم* پایین را ببین.
 - **جلوگیری از همپوشانی:** اگر بکاپی در حال اجراست، اجرای دوم رد می‌شود.
 - **خطاها:** اگر بکاپ یا ارسال خطا بدهد، ربات برایت پیام می‌فرستد. جزئیات در `/var/log/teperbk.log` است (هفتگی چرخش می‌کند).
 - **فایل‌ها:** تنظیمات (توکن ربات و ساعت‌ها) در `/opt/teperbk/config.json` با دسترسی `600` ذخیره می‌شود.
-- **حذف کامل:** `teperbk` ← ۵ ← ۵، کرون‌جاب را پاک و سرویس ربات را متوقف می‌کند.
+- **حذف کامل:** `teperbk` ← ۴ ← ۷، کرون‌جاب را پاک و سرویس ربات را متوقف می‌کند.
+
+#### فایل حجیم تا ۲ گیگابایت (اختیاری)
+انتخاب با خودت است: **بدون API** (پیش‌فرض، هیچ تنظیمی لازم نیست و بکاپ بزرگ در بخش‌های ۴۵ مگابایتی ارسال می‌شود) یا **با API** (یک فایل تا ۲ گیگابایت). اسکریپت موقع راه‌اندازی ربات این را از تو می‌پرسد و هر وقت خواستی از `teperbk` ← **۴** ← **۵** عوضش کنی.
+
+ربات معمولی تلگرام فقط تا ۵۰ مگابایت آپلود می‌پذیرد. برای ارسال یک فایل تا ۲ گیگابایت، اسکریپت می‌تواند **سرور رسمی Telegram Bot API** را داخل یک کانتینر Docker روی سرورت اجرا کند (`aiogram/telegram-bot-api` و فقط روی `127.0.0.1:8081` در دسترس).
+
+۱. از [my.telegram.org](https://my.telegram.org) ← *API development tools* یک `api_id` و `api_hash` بگیر.
+۲. `teperbk` ← **۴** ← **۵** را بزن و آن‌ها را وارد کن. اسکریپت کانتینر را اجرا می‌کند، ربات را از سرور معمولی تلگرام خارج (logOut) می‌کند و به سرور محلی می‌برد.
+۳. برای برگشت: همان گزینه منو آن را خاموش می‌کند. بعد از آن حدود **۱۰ دقیقه** طول می‌کشد تا ربات دوباره جواب بدهد (قانون تلگرام هنگام جابه‌جایی ربات بین سرورها).
+
+نکته: ایمیج کانتینر یک ایمیج شخص ثالث از Docker Hub است و با توکن ربات کار می‌کند، پس فقط اگر اعتماد داری استفاده کن. این حالت اختیاری و پیش‌فرض خاموش است. اگر مشکلی پیش بیاید، حالت عادی ۵۰ مگابایتی با ارسال تکه‌تکه همچنان کار می‌کند.
+
+---
+
+### آپدیت
+`teperbk` ← **۵** را بزن (یا `teperbk --update`). اسکریپت آخرین `teperbk.py` را از گیتهاب دانلود می‌کند، معتبر بودنش را چک می‌کند، فایل قبلی را با نام `/opt/teperbk/teperbk.py.bak` نگه می‌دارد، نسخه جدید را نصب می‌کند و اگر سرویس ربات تلگرام نصب باشد ریستارتش می‌کند. تنظیمات تو دست‌نخورده می‌ماند.
 
 ---
 
