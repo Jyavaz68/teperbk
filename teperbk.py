@@ -44,7 +44,7 @@ class Spinner:
 
     def spin(self):
         while not self.stop_running.is_set():
-            sys.stdout.write(f"\r{Colors.YELLOW}⏳ {next(self.spinner_cycle)} {self.message}{Colors.RESET}")
+            sys.stdout.write(f"\r{Colors.YELLOW}{next(self.spinner_cycle)} {self.message}{Colors.RESET}")
             sys.stdout.flush()
             time.sleep(0.1)
         sys.stdout.write('\r' + ' ' * (len(self.message) + 15) + '\r')
@@ -58,17 +58,29 @@ class Spinner:
         self.stop_running.set()
         self.thread.join()
 
+TEPER_BANNER = """
+████████╗███████╗██████╗ ███████╗██████╗
+╚══██╔══╝██╔════╝██╔══██╗██╔════╝██╔══██╗
+   ██║   █████╗  ██████╔╝█████╗  ██████╔╝
+   ██║   ██╔══╝  ██╔═══╝ ██╔══╝  ██╔══██╗
+   ██║   ███████╗██║     ███████╗██║  ██║
+   ╚═╝   ╚══════╝╚═╝     ╚══════╝╚═╝  ╚═╝
+"""
+
+def print_banner():
+    print(f"{Colors.HEADER}{Colors.BOLD}{TEPER_BANNER}{Colors.RESET}")
+
 def print_info(msg):
-    print(f"{Colors.BLUE}ℹ️  [INFO]{Colors.RESET} {msg}")
+    print(f"{Colors.BLUE}[INFO]{Colors.RESET} {msg}")
 
 def print_success(msg):
-    print(f"{Colors.GREEN}✅ [SUCCESS]{Colors.RESET} {msg}")
+    print(f"{Colors.GREEN}[SUCCESS]{Colors.RESET} {msg}")
 
 def print_warning(msg):
-    print(f"{Colors.YELLOW}⚠️  [WARNING]{Colors.RESET} {msg}")
+    print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} {msg}")
 
 def print_error(msg):
-    print(f"{Colors.RED}❌ [ERROR]{Colors.RESET} {msg}")
+    print(f"{Colors.RED}[ERROR]{Colors.RESET} {msg}")
 
 def print_header(title):
     print(f"\n{Colors.HEADER}{Colors.BOLD}=================================================={Colors.RESET}")
@@ -81,7 +93,7 @@ def pause_and_return():
 try:
     import paramiko
 except ImportError:
-    print(f"{Colors.YELLOW}⏳ Required libraries not found. Starting background installation...{Colors.RESET}")
+    print(f"{Colors.YELLOW}Required libraries not found. Starting background installation...{Colors.RESET}")
     with Spinner("Installing required packages (Paramiko, unzip)... Please wait"):
         try:
             subprocess.check_call(["apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -89,7 +101,7 @@ except ImportError:
         except Exception:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko", "--quiet"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     import paramiko
-    print(f"{Colors.GREEN}✅ Libraries installed successfully!{Colors.RESET}\n")
+    print(f"{Colors.GREEN}Libraries installed successfully!{Colors.RESET}\n")
 
 def run_command(command, output_file=None, cwd=None, quiet=True):
     try:
@@ -219,7 +231,7 @@ def resolve_mysql_root_password_local(compose_dir, extra_candidates=None):
     print_warning("None of the known passwords (.env, pre-restore password) matched the restored database.")
     print_warning("(This happens because MYSQL_ROOT_PASSWORD only applies the first time MySQL initializes — not on every start.)")
     for attempt in range(3):
-        manual_pw = input(f"{Colors.CYAN}🔑 Enter the correct MySQL root password: {Colors.RESET}").strip()
+        manual_pw = input(f"{Colors.CYAN}Enter the correct MySQL root password: {Colors.RESET}").strip()
         if _test_mysql_password_local(compose_dir, manual_pw):
             print_success("Password accepted.")
             if _update_env_var_local(env_path, "MYSQL_ROOT_PASSWORD", manual_pw):
@@ -256,7 +268,7 @@ def resolve_mysql_root_password_ssh(ssh, compose_dir, extra_candidates=None):
     print_warning("None of the known passwords (.env, pre-restore password) matched the restored database.")
     print_warning("(This happens because MYSQL_ROOT_PASSWORD only applies the first time MySQL initializes — not on every start.)")
     for attempt in range(3):
-        manual_pw = input(f"{Colors.CYAN}🔑 Enter the correct MySQL root password: {Colors.RESET}").strip()
+        manual_pw = input(f"{Colors.CYAN}Enter the correct MySQL root password: {Colors.RESET}").strip()
         if _test_mysql_password_ssh(ssh, compose_dir, manual_pw):
             print_success("Password accepted.")
             if _update_env_var_ssh(ssh, env_path, "MYSQL_ROOT_PASSWORD", manual_pw):
@@ -848,10 +860,10 @@ def create_backup(db_type="timescaledb", ask_freeze=False):
         print(f"{Colors.BOLD}--- Backup Mode ---{Colors.RESET}")
         print_info("TEST run  : services keep running (no downtime, data may change during backup).")
         print_info("FINAL run : app + node are stopped so NO data changes during backup (downtime).")
-        freeze = ask_yes_no("🛑 Stop Pasarguard & PG-Node during backup? (y = final / n = test): ")
+        freeze = ask_yes_no("Stop Pasarguard & PG-Node during backup? (y = final / n = test): ")
         if freeze:
             keep_stopped = ask_yes_no(
-                "⏸️  Keep them STOPPED after backup finishes? (y = keep stopped for migration / n = start again) [n]: ",
+                "Keep them STOPPED after backup finishes? (y = keep stopped for migration / n = start again) [n]: ",
                 default=False,
             )
             print_warning("Pasarguard and PG-Node will be stopped now. Users will be disconnected!")
@@ -884,7 +896,7 @@ def create_backup(db_type="timescaledb", ask_freeze=False):
     return zip_path
 
 def execute_ssh_command(ssh, command, description, required=True):
-    print(f"{Colors.CYAN}🌐 [SSH]{Colors.RESET} {description}...")
+    print(f"{Colors.CYAN}[SSH]{Colors.RESET} {description}...")
     exit_status, out, err = ssh_shell(ssh, command)
 
     if exit_status == 0:
@@ -906,10 +918,10 @@ def workflow_auto_backup_restore(db_type="timescaledb"):
         return
 
     print("")
-    send_to_tg = input(f"{Colors.CYAN}🤖 Do you want to send this backup to a Telegram Bot first? (y/n): {Colors.RESET}").strip().lower()
+    send_to_tg = input(f"{Colors.CYAN}Do you want to send this backup to a Telegram Bot first? (y/n): {Colors.RESET}").strip().lower()
     if send_to_tg == 'y':
-        bot_token = input(f"{Colors.CYAN}🔑 Enter Telegram Bot Token: {Colors.RESET}").strip()
-        admin_id = input(f"{Colors.CYAN}👤 Enter Admin Numeric Chat ID: {Colors.RESET}").strip()
+        bot_token = input(f"{Colors.CYAN}Enter Telegram Bot Token: {Colors.RESET}").strip()
+        admin_id = input(f"{Colors.CYAN}Enter Admin Numeric Chat ID: {Colors.RESET}").strip()
         
         print_info("Uploading backup to Telegram (Please wait)...")
         caption = f"📦 Pasarguard & PG-Node Manual Transfer Backup\nDate: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -920,16 +932,16 @@ def workflow_auto_backup_restore(db_type="timescaledb"):
             print_error(f"Telegram upload failed: {details}")
 
     print(f"\n{Colors.BOLD}--- New Server Information ---{Colors.RESET}")
-    new_server_ip = input(f"{Colors.CYAN}🖥️  Enter New Server IP: {Colors.RESET}").strip()
-    ssh_port_input = input(f"{Colors.CYAN}🔌 Enter SSH Port (Default 22): {Colors.RESET}").strip()
+    new_server_ip = input(f"{Colors.CYAN}Enter New Server IP: {Colors.RESET}").strip()
+    ssh_port_input = input(f"{Colors.CYAN}Enter SSH Port (Default 22): {Colors.RESET}").strip()
     ssh_port = int(ssh_port_input) if ssh_port_input.isdigit() else 22
     
-    is_root = input(f"{Colors.CYAN}⚠️  User MUST be root. Do you confirm? (y/n): {Colors.RESET}").strip().lower()
+    is_root = input(f"{Colors.CYAN}User MUST be root. Do you confirm? (y/n): {Colors.RESET}").strip().lower()
     if is_root != 'y':
         print_error("Root access is required. Aborting...")
         return
         
-    new_server_pass = input(f"{Colors.CYAN}🔑 Enter Root Password: {Colors.RESET}").strip()
+    new_server_pass = input(f"{Colors.CYAN}Enter Root Password: {Colors.RESET}").strip()
 
     print_info(f"Connecting to {new_server_ip}:{ssh_port}...")
     ssh = paramiko.SSHClient()
@@ -957,7 +969,7 @@ def workflow_auto_backup_restore(db_type="timescaledb"):
             print_error("Aborting: directory cleanup failed.")
             return
 
-        print(f"{Colors.CYAN}🌐 [SSH]{Colors.RESET} Uploading backup file (This depends on your internet speed)...")
+        print(f"{Colors.CYAN}[SSH]{Colors.RESET} Uploading backup file (This depends on your internet speed)...")
         sftp = ssh.open_sftp()
         zip_filename = os.path.basename(zip_file_path)
         remote_zip_path = f"/opt/pasarguard/{zip_filename}"
@@ -1031,7 +1043,7 @@ def workflow_auto_backup_restore(db_type="timescaledb"):
             print_error("Aborting: PG-Node containers did not start correctly.")
             return
 
-        print_header("Transfer & Restore Completed Successfully! 🎉")
+        print_header("Transfer & Restore Completed Successfully!")
         print_success("Verified: Pasarguard and PG-Node Docker stacks are running on the new server.")
 
     except paramiko.AuthenticationException:
@@ -1061,7 +1073,7 @@ def workflow_manual_restore():
     print_header("Manual Restore (Local)")
     print_info("This process will wipe the current Pasarguard & PG-Node setup and restore from a ZIP file.")
     
-    zip_name = input(f"{Colors.CYAN}📦 Enter the exact Backup ZIP file name (e.g. backup_2026.zip): {Colors.RESET}").strip()
+    zip_name = input(f"{Colors.CYAN}Enter the exact Backup ZIP file name (e.g. backup_2026.zip): {Colors.RESET}").strip()
     
     if not os.path.exists(zip_name):
         print_error(f"Cannot find the file '{zip_name}' in the current directory!")
@@ -1071,7 +1083,7 @@ def workflow_manual_restore():
     if not db_type:
         return
 
-    confirm = input(f"{Colors.RED}⚠️  WARNING: This will overwrite your current configuration and database. Continue? (y/n): {Colors.RESET}").strip().lower()
+    confirm = input(f"{Colors.RED}WARNING: This will overwrite your current configuration and database. Continue? (y/n): {Colors.RESET}").strip().lower()
     if confirm != 'y':
         print_warning("Restore process aborted by user.")
         return
@@ -1154,7 +1166,7 @@ def workflow_manual_restore():
         if not start_compose_stack_local(PG_NODE_DIR, "PG-Node"):
             raise Exception("PG-Node containers did not start correctly")
         
-        print_header("Local Restore Completed Successfully! 🎉")
+        print_header("Local Restore Completed Successfully!")
         print_success("Verified: Pasarguard and PG-Node Docker stacks are running.")
 
     except Exception as e:
@@ -2098,8 +2110,8 @@ def tgm_large_enable():
     if not ask_yes_no("Continue? (y/n): ", default=False):
         return
 
-    api_id = input(f"{Colors.CYAN}🆔 api_id: {Colors.RESET}").strip()
-    api_hash = input(f"{Colors.CYAN}🔐 api_hash: {Colors.RESET}").strip()
+    api_id = input(f"{Colors.CYAN}api_id: {Colors.RESET}").strip()
+    api_hash = input(f"{Colors.CYAN}api_hash: {Colors.RESET}").strip()
     if not api_id.isdigit() or not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
         print_error("api_id must be a number and api_hash a 32 character hex string.")
         return
@@ -2178,7 +2190,7 @@ def tgm_large_disable():
 # ----------------------------------------------- terminal menu (option 4) ----
 def _tgm_ask_token():
     while True:
-        token = input(f"{Colors.CYAN}🔑 Enter Telegram Bot Token (from @BotFather): {Colors.RESET}").strip()
+        token = input(f"{Colors.CYAN}Enter Telegram Bot Token (from @BotFather): {Colors.RESET}").strip()
         if not token:
             continue
         res = tg_api(token, "getMe")
@@ -2189,7 +2201,7 @@ def _tgm_ask_token():
 
 def _tgm_ask_chat_id():
     while True:
-        chat_id = input(f"{Colors.CYAN}👤 Enter Admin numeric Chat ID (your own account, not a group): {Colors.RESET}").strip()
+        chat_id = input(f"{Colors.CYAN}Enter Admin numeric Chat ID (your own account, not a group): {Colors.RESET}").strip()
         if chat_id.lstrip("-").isdigit():
             return chat_id
         print_error("Chat ID must be a number.")
@@ -2197,7 +2209,7 @@ def _tgm_ask_chat_id():
 def _tgm_ask_tz(default):
     print_info("Time zone for backup hours and dates (examples: Asia/Tehran, Europe/Berlin, UTC, or 'local' for the server time).")
     while True:
-        raw = input(f"{Colors.CYAN}🕒 Time zone [{default or 'local'}]: {Colors.RESET}").strip()
+        raw = input(f"{Colors.CYAN}Time zone [{default or 'local'}]: {Colors.RESET}").strip()
         name = normalize_tz_name(raw if raw else (default or "local"))
         if name is not None:
             return name
@@ -2208,7 +2220,7 @@ def _tgm_ask_times(default, cfg):
     print_info("Enter the daily backup times (24h), separated by comma or space. Example: 03:00, 15:30")
     print_info("One time = once a day, three times = three backups per day.")
     while True:
-        raw = input(f"{Colors.CYAN}⏰ Times [{', '.join(default)}]: {Colors.RESET}").strip()
+        raw = input(f"{Colors.CYAN}Times [{', '.join(default)}]: {Colors.RESET}").strip()
         if not raw:
             return list(default)
         times, err = parse_times(raw)
@@ -2227,7 +2239,7 @@ def tgm_setup():
         print_warning("A different bot was entered: large file mode was switched off for it.")
         cfg.update(large_files=False, api_base="")
 
-    lang_choice = input(f"{Colors.CYAN}🌐 Bot language (1 = فارسی, 2 = English) [1]: {Colors.RESET}").strip()
+    lang_choice = input(f"{Colors.CYAN}Bot language (1 = فارسی, 2 = English) [1]: {Colors.RESET}").strip()
     cfg["lang"] = "en" if lang_choice == "2" else "fa"
     cfg["tz"] = _tgm_ask_tz(cfg.get("tz", "Asia/Tehran"))
     cfg["times"] = _tgm_ask_times(cfg.get("times") or ["03:00"], cfg)
@@ -2344,15 +2356,15 @@ def workflow_telegram_manager():
             print_info("Large files: " + ("ON (up to 2 GB)" if cfg.get("large_files") else "off (50 MB, bigger backups are split)"))
         else:
             print_warning("Not connected yet. Start with option 1.")
-        print(f"\n{Colors.BLUE}1-{Colors.RESET} 🔗 Connect / change Telegram bot (+ auto create cron job)")
-        print(f"{Colors.BLUE}2-{Colors.RESET} ⏰ Change daily backup times")
-        print(f"{Colors.BLUE}3-{Colors.RESET} 🕒 Change time zone")
-        print(f"{Colors.BLUE}4-{Colors.RESET} 📦 Run a backup now and send it to Telegram")
-        print(f"{Colors.BLUE}5-{Colors.RESET} 🗄️  Large files up to 2 GB (enable / disable)")
-        print(f"{Colors.BLUE}6-{Colors.RESET} 📊 Show status")
-        print(f"{Colors.BLUE}7-{Colors.RESET} 🗑️  Disable (remove cron job & stop bot)")
-        print(f"{Colors.RED}8-{Colors.RESET} ⬅️  Back to main menu")
-        choice = input(f"\n{Colors.CYAN}👉 Select an option (1-8): {Colors.RESET}").strip()
+        print(f"\n{Colors.BLUE}1-{Colors.RESET} Connect / change Telegram bot (+ auto create cron job)")
+        print(f"{Colors.BLUE}2-{Colors.RESET} Change daily backup times")
+        print(f"{Colors.BLUE}3-{Colors.RESET} Change time zone")
+        print(f"{Colors.BLUE}4-{Colors.RESET} Run a backup now and send it to Telegram")
+        print(f"{Colors.BLUE}5-{Colors.RESET} Large files up to 2 GB (enable / disable)")
+        print(f"{Colors.BLUE}6-{Colors.RESET} Show status")
+        print(f"{Colors.BLUE}7-{Colors.RESET} Disable (remove cron job & stop bot)")
+        print(f"{Colors.RED}8-{Colors.RESET} Back to main menu")
+        choice = input(f"\n{Colors.CYAN}Select an option (1-8): {Colors.RESET}").strip()
 
         if choice == "1":
             tgm_setup()
@@ -2437,21 +2449,22 @@ def main():
     while True:
         os.system('cls' if os.name == 'nt' else 'clear')
 
-        print(f"\n{Colors.HEADER}{Colors.BOLD}=================================================={Colors.RESET}")
-        print(f"{Colors.HEADER}{Colors.BOLD}          🛡️  PASARGUARD MANAGER UTILITY 🛡️           {Colors.RESET}")
+        print_banner()
+        print(f"{Colors.HEADER}{Colors.BOLD}=================================================={Colors.RESET}")
+        print(f"{Colors.HEADER}{Colors.BOLD}            PASARGUARD MANAGER UTILITY            {Colors.RESET}")
         print(f"{Colors.HEADER}{Colors.BOLD}=================================================={Colors.RESET}")
         print(f"{Colors.CYAN}       Dev by: jyavaz   |   Version: {VERSION}{Colors.RESET}")
         print(f"{Colors.CYAN}       GitHub: https://github.com/jyavaz68/{Colors.RESET}")
         print(f"{Colors.HEADER}{Colors.BOLD}=================================================={Colors.RESET}\n")
-        print(f"{Colors.BLUE}1-{Colors.RESET} 🚀 Auto Backup & Transfer to New Server")
-        print(f"{Colors.BLUE}2-{Colors.RESET} 💾 Manual Backup (Save locally)")
-        print(f"{Colors.BLUE}3-{Colors.RESET} 🔄 Manual Restore (From local zip)")
-        print(f"{Colors.BLUE}4-{Colors.RESET} ⏰ Telegram Bot & Daily Schedule (cron job)")
-        print(f"{Colors.BLUE}5-{Colors.RESET} ⬆️  Update (get the latest version from GitHub)")
-        print(f"{Colors.RED}6-{Colors.RESET} 🚪 Exit")
+        print(f"{Colors.BLUE}1-{Colors.RESET} Auto Backup & Transfer to New Server")
+        print(f"{Colors.BLUE}2-{Colors.RESET} Manual Backup (Save locally)")
+        print(f"{Colors.BLUE}3-{Colors.RESET} Manual Restore (From local zip)")
+        print(f"{Colors.BLUE}4-{Colors.RESET} Telegram Bot & Daily Schedule (cron job)")
+        print(f"{Colors.BLUE}5-{Colors.RESET} Update (get the latest version from GitHub)")
+        print(f"{Colors.RED}6-{Colors.RESET} Exit")
         print(f"{Colors.HEADER}--------------------------------------------------{Colors.RESET}")
 
-        choice = input(f"{Colors.CYAN}👉 Please select an option (1-6): {Colors.RESET}").strip()
+        choice = input(f"{Colors.CYAN}Please select an option (1-6): {Colors.RESET}").strip()
 
         db_type = None
         if choice in ['1', '2']:
@@ -2478,7 +2491,7 @@ def main():
                 sys.exit(0)
             pause_and_return()
         elif choice == '6':
-            print(f"{Colors.YELLOW}🚪 Exiting... Have a great day!{Colors.RESET}")
+            print(f"{Colors.YELLOW}Exiting... Have a great day!{Colors.RESET}")
             sys.exit(0)
         else:
             print_error("Invalid option! Please try again.")
