@@ -171,23 +171,64 @@ def _update_env_var_ssh(ssh, env_path, var_name, new_value):
     exit_code, _, _ = ssh_shell(ssh, cmd)
     return exit_code == 0
 
+# ---- MySQL / MariaDB flavor helpers -------------------------------------
+MYSQL_SERVICE = "mysql"   # compose service of the MySQL-family database ("mysql" or "mariadb")
+
+# Newer MariaDB images only ship mariadb / mariadb-dump / mariadb-admin, so map the old names when missing.
+_MARIADB_COMPAT = (
+    'MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}"; export MYSQL_ROOT_PASSWORD; '
+    'if ! command -v mysql >/dev/null 2>&1; then mysql() { mariadb "$@"; }; fi; '
+    'if ! command -v mysqldump >/dev/null 2>&1; then mysqldump() { mariadb-dump "$@"; }; fi; '
+    'if ! command -v mysqladmin >/dev/null 2>&1; then mysqladmin() { mariadb-admin "$@"; }; fi; '
+)
+
+def is_mysql_family(db_type):
+    return db_type in ("mysql", "mariadb")
+
+def set_mysql_flavor(db_type):
+    global MYSQL_SERVICE
+    MYSQL_SERVICE = "mariadb" if db_type == "mariadb" else "mysql"
+
+def mysql_exec(script):
+    """'docker compose exec -T <service> sh -c <script>' that works for MySQL and MariaDB images."""
+    prefix = _MARIADB_COMPAT if MYSQL_SERVICE == "mariadb" else ""
+    return f"docker compose exec -T {MYSQL_SERVICE} sh -c " + shlex.quote(prefix + script)
+
+def _read_root_pw_local(env_path):
+    for key in ("MYSQL_ROOT_PASSWORD", "MARIADB_ROOT_PASSWORD"):
+        value = _read_env_var(env_path, key)
+        if value:
+            return value
+    return None
+
+def _root_pw_key_local(env_path):
+    for key in ("MYSQL_ROOT_PASSWORD", "MARIADB_ROOT_PASSWORD"):
+        if _read_env_var(env_path, key):
+            return key
+    return "MYSQL_ROOT_PASSWORD"
+
+def _root_pw_key_ssh(ssh, env_path):
+    code, out, _ = ssh_shell(ssh, f"grep -oE '^(MYSQL|MARIADB)_ROOT_PASSWORD' {env_path} 2>/dev/null | head -n1")
+    key = out.strip() if code == 0 else ""
+    return key if key in ("MYSQL_ROOT_PASSWORD", "MARIADB_ROOT_PASSWORD") else "MYSQL_ROOT_PASSWORD"
+
 def _test_mysql_password_local(compose_dir, password):
     if password is None:
         return False
-    cmd = "docker compose exec -T mysql sh -c " + shlex.quote(f'mysql -uroot -p{password} -e "SELECT 1;"')
+    cmd = mysql_exec(f'mysql -uroot -p{password} -e "SELECT 1;"')
     ok, _, _ = local_shell(cmd, cwd=compose_dir)
     return ok
 
 def _test_mysql_password_ssh(ssh, compose_dir, password):
     if password is None:
         return False
-    cmd = f"cd {compose_dir} && docker compose exec -T mysql sh -c " + shlex.quote(f'mysql -uroot -p{password} -e "SELECT 1;"')
+    cmd = f"cd {compose_dir} && " + mysql_exec(f'mysql -uroot -p{password} -e "SELECT 1;"')
     exit_code, _, _ = ssh_shell(ssh, cmd)
     return exit_code == 0
 
 def capture_current_mysql_password_local(compose_dir):
     env_path = os.path.join(compose_dir, ".env")
-    current_password = _read_env_var(env_path, "MYSQL_ROOT_PASSWORD")
+    current_password = _read_root_pw_local(env_path)
     if not current_password:
         return None
     running = _running_compose_ids_local(compose_dir)
@@ -199,7 +240,7 @@ def capture_current_mysql_password_ssh(ssh, compose_dir):
     env_path = f"{compose_dir}/.env"
     exit_code, current_password, _ = ssh_shell(
         ssh,
-        f"grep '^MYSQL_ROOT_PASSWORD=' {env_path} 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\"'"
+        f"grep -E '^(MYSQL|MARIADB)_ROOT_PASSWORD=' {env_path} 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\"'"
     )
     current_password = current_password.strip() if exit_code == 0 else None
     if not current_password:
@@ -212,7 +253,7 @@ def capture_current_mysql_password_ssh(ssh, compose_dir):
 def resolve_mysql_root_password_local(compose_dir, extra_candidates=None):
     env_path = os.path.join(compose_dir, ".env")
     candidates = []
-    env_password = _read_env_var(env_path, "MYSQL_ROOT_PASSWORD")
+    env_password = _read_root_pw_local(env_path)
     if env_password:
         candidates.append(env_password)
     for c in (extra_candidates or []):
@@ -222,7 +263,7 @@ def resolve_mysql_root_password_local(compose_dir, extra_candidates=None):
     for pw in candidates:
         if _test_mysql_password_local(compose_dir, pw):
             if pw != env_password:
-                if _update_env_var_local(env_path, "MYSQL_ROOT_PASSWORD", pw):
+                if _update_env_var_local(env_path, _root_pw_key_local(env_path), pw):
                     print_success(f"Found a working MySQL root password and synced it into .env.")
                 else:
                     print_warning("Found a working password but couldn't auto-update .env — update it manually.")
@@ -234,7 +275,7 @@ def resolve_mysql_root_password_local(compose_dir, extra_candidates=None):
         manual_pw = input(f"{Colors.CYAN}Enter the correct MySQL root password: {Colors.RESET}").strip()
         if _test_mysql_password_local(compose_dir, manual_pw):
             print_success("Password accepted.")
-            if _update_env_var_local(env_path, "MYSQL_ROOT_PASSWORD", manual_pw):
+            if _update_env_var_local(env_path, _root_pw_key_local(env_path), manual_pw):
                 print_success(".env updated so future runs use this password automatically.")
             else:
                 print_warning("Could not update .env automatically — update it manually.")
@@ -246,7 +287,7 @@ def resolve_mysql_root_password_ssh(ssh, compose_dir, extra_candidates=None):
     env_path = f"{compose_dir}/.env"
     exit_code, env_password, _ = ssh_shell(
         ssh,
-        f"grep '^MYSQL_ROOT_PASSWORD=' {env_path} 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\"'"
+        f"grep -E '^(MYSQL|MARIADB)_ROOT_PASSWORD=' {env_path} 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\"'"
     )
     env_password = env_password.strip() if exit_code == 0 else None
     candidates = []
@@ -259,7 +300,7 @@ def resolve_mysql_root_password_ssh(ssh, compose_dir, extra_candidates=None):
     for pw in candidates:
         if _test_mysql_password_ssh(ssh, compose_dir, pw):
             if pw != env_password:
-                if _update_env_var_ssh(ssh, env_path, "MYSQL_ROOT_PASSWORD", pw):
+                if _update_env_var_ssh(ssh, env_path, _root_pw_key_ssh(ssh, env_path), pw):
                     print_success("Found a working MySQL root password and synced it into .env.")
                 else:
                     print_warning("Found a working password but couldn't auto-update .env — update it manually.")
@@ -271,7 +312,7 @@ def resolve_mysql_root_password_ssh(ssh, compose_dir, extra_candidates=None):
         manual_pw = input(f"{Colors.CYAN}Enter the correct MySQL root password: {Colors.RESET}").strip()
         if _test_mysql_password_ssh(ssh, compose_dir, manual_pw):
             print_success("Password accepted.")
-            if _update_env_var_ssh(ssh, env_path, "MYSQL_ROOT_PASSWORD", manual_pw):
+            if _update_env_var_ssh(ssh, env_path, _root_pw_key_ssh(ssh, env_path), manual_pw):
                 print_success(".env updated so future runs use this password automatically.")
             else:
                 print_warning("Could not update .env automatically — update it manually.")
@@ -293,6 +334,7 @@ def sync_app_db_credentials_local(compose_dir, mysql_root_password):
         return False
 
     print_info(f"Syncing application DB user '{db_user}' password with .env...")
+    safe_pw = _escape_mysql_literal(db_password)
     sql = (
         f"CREATE USER IF NOT EXISTS '{db_user}'@'%' IDENTIFIED BY '{safe_pw}'; "
         f"ALTER USER '{db_user}'@'%' IDENTIFIED BY '{safe_pw}'; "
@@ -300,7 +342,7 @@ def sync_app_db_credentials_local(compose_dir, mysql_root_password):
         f"FLUSH PRIVILEGES;"
     )
     mysql_cmd = shlex.join(["mysql", "-uroot", f"-p{mysql_root_password}", "-e", sql])
-    cmd = "docker compose exec -T mysql sh -c " + shlex.quote(mysql_cmd)
+    cmd = mysql_exec(mysql_cmd)
     ok, _, err = local_shell(cmd, cwd=compose_dir)
     if not ok:
         print_error(f"Failed to sync application DB user '{db_user}'.")
@@ -309,7 +351,7 @@ def sync_app_db_credentials_local(compose_dir, mysql_root_password):
         return False
 
     verify_mysql_cmd = shlex.join(["mysql", f"-u{db_user}", f"-p{db_password}", "-e", f"USE {db_name}; SELECT 1;"])
-    verify_cmd = "docker compose exec -T mysql sh -c " + shlex.quote(verify_mysql_cmd)
+    verify_cmd = mysql_exec(verify_mysql_cmd)
     if not local_shell(verify_cmd, cwd=compose_dir)[0]:
         print_error(f"Synced '{db_user}' but the new credentials still don't authenticate — aborting.")
         return False
@@ -347,7 +389,7 @@ def sync_app_db_credentials_ssh(ssh, compose_dir, mysql_root_password):
         f"FLUSH PRIVILEGES;"
     )
     mysql_cmd = shlex.join(["mysql", "-uroot", f"-p{mysql_root_password}", "-e", sql])
-    cmd = f"cd {compose_dir} && docker compose exec -T mysql sh -c " + shlex.quote(mysql_cmd)
+    cmd = f"cd {compose_dir} && " + mysql_exec(mysql_cmd)
     exit_code, _, err = ssh_shell(ssh, cmd)
     if exit_code != 0:
         print_error(f"Failed to sync application DB user '{db_user}'.")
@@ -356,7 +398,7 @@ def sync_app_db_credentials_ssh(ssh, compose_dir, mysql_root_password):
         return False
 
     verify_mysql_cmd = shlex.join(["mysql", f"-u{db_user}", f"-p{db_password}", "-e", f"USE {db_name}; SELECT 1;"])
-    verify_cmd = f"cd {compose_dir} && docker compose exec -T mysql sh -c " + shlex.quote(verify_mysql_cmd)
+    verify_cmd = f"cd {compose_dir} && " + mysql_exec(verify_mysql_cmd)
     verify_code, _, _ = ssh_shell(ssh, verify_cmd)
     if verify_code != 0:
         print_error(f"Synced '{db_user}' but the new credentials still don't authenticate — aborting.")
@@ -545,30 +587,30 @@ def wait_for_postgres_ready_ssh(ssh):
     return False
 
 def wait_for_mysql_ready_local():
-    print_info("Waiting for mysql to become ready...")
+    print_info(f"Waiting for {MYSQL_SERVICE} to become ready...")
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
     while time.time() < deadline:
         ok, _, _ = local_shell(
-            "docker compose exec -T mysql sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'",
+            mysql_exec('mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent'),
             cwd=PASARGUARD_DIR,
         )
         if ok:
-            print_success("MySQL is ready for restore operations.")
+            print_success("MySQL/MariaDB is ready for restore operations.")
             return True
         time.sleep(POSTGRES_READY_INTERVAL)
     print_error("MySQL did not become ready in time.")
     return False
 
 def wait_for_mysql_ready_ssh(ssh):
-    print_info("Waiting for mysql to become ready...")
+    print_info(f"Waiting for {MYSQL_SERVICE} to become ready...")
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
     while time.time() < deadline:
         exit_code, _, _ = ssh_shell(
             ssh,
-            f"cd {PASARGUARD_DIR} && docker compose exec -T mysql sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'",
+            f"cd {PASARGUARD_DIR} && " + mysql_exec('mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent'),
         )
         if exit_code == 0:
-            print_success("MySQL is ready for restore operations.")
+            print_success("MySQL/MariaDB is ready for restore operations.")
             return True
         time.sleep(POSTGRES_READY_INTERVAL)
     print_error("MySQL did not become ready in time.")
@@ -677,14 +719,19 @@ def detect_db_type_local():
         print_success("Detected database: TimescaleDB (PostgreSQL)")
         return "timescaledb"
     if "mysql" in services:
+        set_mysql_flavor("mysql")
         print_success("Detected database: MySQL")
         return "mysql"
+    if "mariadb" in services:
+        set_mysql_flavor("mariadb")
+        print_success("Detected database: MariaDB")
+        return "mariadb"
 
     db_url = _read_env_var(os.path.join(PASARGUARD_DIR, ".env"), "SQLALCHEMY_DATABASE_URL") or ""
     scheme = db_url.split("://", 1)[0] if "://" in db_url else "unknown"
     print_error("Unsupported or undetected database.")
     print_error(f"Compose services: {', '.join(services) if services else 'none'} | DB driver in .env: {scheme}")
-    print_error("This tool supports only TimescaleDB and MySQL (running as docker compose services).")
+    print_error("This tool supports only TimescaleDB, MySQL and MariaDB (running as docker compose services).")
     return None
 
 def detect_db_type_from_zip(zip_path):
@@ -700,8 +747,17 @@ def detect_db_type_from_zip(zip_path):
         print_success("Backup database type: TimescaleDB (PostgreSQL)")
         return "timescaledb"
     if "pg_dump/db_backup.sql" in names:
-        print_success("Backup database type: MySQL")
-        return "mysql"
+        flavor = "mysql"
+        try:
+            with zipfile.ZipFile(zip_path) as z:
+                compose_text = z.read("docker-compose.yml").decode("utf-8", "replace")
+            if re.search(r"^\s{2}mariadb:\s*$", compose_text, re.M) and not re.search(r"^\s{2}mysql:\s*$", compose_text, re.M):
+                flavor = "mariadb"
+        except Exception:
+            pass
+        set_mysql_flavor(flavor)
+        print_success(f"Backup database type: {'MariaDB' if flavor == 'mariadb' else 'MySQL'}")
+        return flavor
 
     print_error("This ZIP does not look like a valid backup (no database dump found).")
     return None
@@ -755,7 +811,7 @@ def _create_backup_core(db_type="timescaledb", out_dir=None):
                 f.write("pasarguard\tpasarguard\t1\tdb-001.sql\t2.28.1\n")
         else:
             print_info("Exporting MySQL database... (Please wait, this might take a while for large databases)")
-            cmd_db = 'docker compose exec -T mysql sh -c \'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" pasarguard\''
+            cmd_db = mysql_exec('mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" pasarguard')
             dump_path = os.path.join(pg_dump_dir, "db_backup.sql")
             if not run_command(cmd_db, output_file=dump_path, cwd=opt_dir) or not _file_not_empty(dump_path):
                 raise Exception("Database export failed or produced an empty file. Backup aborted.")
@@ -796,7 +852,7 @@ def _create_backup_core(db_type="timescaledb", out_dir=None):
 def freeze_services_local(db_type):
     """Stop PG-Node and the Pasarguard app containers, but keep the database
     container running so that the dump can still be taken (consistent data)."""
-    db_service = "timescaledb" if db_type == "timescaledb" else "mysql"
+    db_service = "timescaledb" if db_type == "timescaledb" else MYSQL_SERVICE
     ok = True
 
     if os.path.isfile(os.path.join(PG_NODE_DIR, "docker-compose.yml")):
@@ -955,7 +1011,7 @@ def workflow_auto_backup_restore(db_type="timescaledb"):
         execute_ssh_command(ssh, "apt-get update >/dev/null 2>&1 && apt-get install -y unzip >/dev/null 2>&1", "Installing 'unzip' package silently")
 
         pre_restore_mysql_password = None
-        if db_type == "mysql":
+        if is_mysql_family(db_type):
             pre_restore_mysql_password = capture_current_mysql_password_ssh(ssh, PASARGUARD_DIR)
 
         if not stop_compose_stack_ssh(ssh, PG_NODE_DIR, "PG-Node"):
@@ -1008,7 +1064,7 @@ def workflow_auto_backup_restore(db_type="timescaledb"):
                 print_error("Aborting: failed to restore db-001.sql.")
                 return
         else:
-            if not start_compose_stack_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB", services=["mysql"], wait_mysql=True):
+            if not start_compose_stack_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB", services=[MYSQL_SERVICE], wait_mysql=True):
                 print_error("Aborting: mysql did not start correctly.")
                 return
 
@@ -1019,13 +1075,13 @@ def workflow_auto_backup_restore(db_type="timescaledb"):
                 print_error("Aborting: could not authenticate to MySQL with any provided password.")
                 return
 
-            drop_create_cmd = "cd /opt/pasarguard && docker compose exec -T mysql sh -c " + shlex.quote(
+            drop_create_cmd = "cd /opt/pasarguard && " + mysql_exec(
                 f'mysql -uroot -p{mysql_pw} -e "DROP DATABASE IF EXISTS pasarguard; CREATE DATABASE pasarguard;"'
             )
             if not execute_ssh_command(ssh, drop_create_cmd, "Dropping old database and creating a fresh one"):
                 print_error("Aborting: failed to drop/create mysql database.")
                 return
-            restore_cmd = "cd /opt/pasarguard && cat pg_dump/db_backup.sql | docker compose exec -T mysql sh -c " + shlex.quote(
+            restore_cmd = "cd /opt/pasarguard && cat pg_dump/db_backup.sql | " + mysql_exec(
                 f'mysql -uroot -p{mysql_pw} pasarguard'
             )
             if not execute_ssh_command(ssh, restore_cmd, "Restoring db_backup.sql (Please wait)"):
@@ -1089,7 +1145,7 @@ def workflow_manual_restore():
         return
 
     pre_restore_mysql_password = None
-    if db_type == "mysql":
+    if is_mysql_family(db_type):
         pre_restore_mysql_password = capture_current_mysql_password_local(PASARGUARD_DIR)
 
     try:
@@ -1135,7 +1191,7 @@ def workflow_manual_restore():
             if not run_command("cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T timescaledb psql -U pasarguard -d pasarguard"):
                 raise Exception("Failed to restore db-001.sql")
         else:
-            if not start_compose_stack_local(PASARGUARD_DIR, "Pasarguard DB", services=["mysql"], wait_mysql=True):
+            if not start_compose_stack_local(PASARGUARD_DIR, "Pasarguard DB", services=[MYSQL_SERVICE], wait_mysql=True):
                 raise Exception("mysql did not start correctly")
 
             mysql_pw = resolve_mysql_root_password_local(
@@ -1145,14 +1201,14 @@ def workflow_manual_restore():
                 raise Exception("Could not authenticate to MySQL with any provided password")
 
             print_info("Dropping old database and creating a fresh one...")
-            drop_create_cmd = "cd /opt/pasarguard && docker compose exec -T mysql sh -c " + shlex.quote(
+            drop_create_cmd = "cd /opt/pasarguard && " + mysql_exec(
                 f'mysql -uroot -p{mysql_pw} -e "DROP DATABASE IF EXISTS pasarguard; CREATE DATABASE pasarguard;"'
             )
             if not run_command(drop_create_cmd):
                 raise Exception("Failed to drop/create mysql database")
 
             print_info("Restoring MySQL database... (Please wait)")
-            restore_cmd = "cd /opt/pasarguard && cat pg_dump/db_backup.sql | docker compose exec -T mysql sh -c " + shlex.quote(
+            restore_cmd = "cd /opt/pasarguard && cat pg_dump/db_backup.sql | " + mysql_exec(
                 f'mysql -uroot -p{mysql_pw} pasarguard'
             )
             if not run_command(restore_cmd):
@@ -1370,7 +1426,7 @@ BOT_STR = {
         "backup_start": "⏳ Backup started... this can take a few minutes.",
         "backup_busy": "⏳ Another backup is already running. Try again later.",
         "backup_fail": "❌ Backup failed. Check the server log: {log}",
-        "detect_fail": "❌ Could not detect the panel database (only TimescaleDB and MySQL are supported). Log: {log}",
+        "detect_fail": "❌ Could not detect the panel database (only TimescaleDB, MySQL and MariaDB are supported). Log: {log}",
         "upload_fail": "⚠️ The backup was created on the server but sending it to Telegram failed:\n{err}",
         "caption": "📦 PasarGuard backup\n🖥 Server: {host}\n🗄 Database: {db}\n📏 Size: {size}\n🕒 Time: {time}",
         "part_note": "🧩 Part {i} of {n}\nJoin on the server: cat {name}.part* > {name}",
@@ -1409,7 +1465,7 @@ BOT_STR = {
         "backup_start": "⏳ بکاپ شروع شد... چند دقیقه طول می‌کشد.",
         "backup_busy": "⏳ یک بکاپ دیگر در حال انجام است. بعداً دوباره امتحان کن.",
         "backup_fail": "❌ بکاپ ناموفق بود. لاگ سرور را چک کن: {log}",
-        "detect_fail": "❌ دیتابیس پنل تشخیص داده نشد (فقط TimescaleDB و MySQL پشتیبانی می‌شود). لاگ: {log}",
+        "detect_fail": "❌ دیتابیس پنل تشخیص داده نشد (فقط TimescaleDB، MySQL و MariaDB پشتیبانی می‌شود). لاگ: {log}",
         "upload_fail": "⚠️ بکاپ روی سرور ساخته شد ولی ارسال به تلگرام ناموفق بود:\n{err}",
         "caption": "📦 بکاپ پاسارگاد\n🖥 سرور: {host}\n🗄 دیتابیس: {db}\n📏 حجم: {size}\n🕒 زمان: {time}",
         "part_note": "🧩 بخش {i} از {n}\nبرای ادغام روی سرور: cat {name}.part* > {name}",

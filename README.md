@@ -11,7 +11,7 @@ Backup, restore & server migration tool for **PasarGuard** and **PG-Node**.
 
 ### Features
 - Full backup of PasarGuard + PG-Node (config, data, database)
-- Supports **TimescaleDB (PostgreSQL)** and **MySQL**, and **detects your database automatically** (no questions asked)
+- Supports **TimescaleDB (PostgreSQL)**, **MySQL** and **MariaDB**, and **detects your database automatically** (no questions asked)
 - Aborts the backup if the database export fails, so you never end up with an empty backup
 - One-step migration to a new server over SSH
 - **Telegram bot + daily schedule:** pick how many times per day and at what hours, from the terminal or from the bot. The cron job is created and updated automatically, and only the latest backup is kept on the server
@@ -51,7 +51,7 @@ teperbk
 | 5 | **Update** | Download the latest version from GitHub |
 | 6 | Exit | |
 
-The database type is **detected automatically**: for backups it reads the services in `/opt/pasarguard/docker-compose.yml`, and for restore it reads the content of the ZIP file. If your panel uses something else (SQLite, MariaDB, plain PostgreSQL), the script tells you it is unsupported and stops.
+The database type is **detected automatically**: for backups it reads the services in `/opt/pasarguard/docker-compose.yml`, and for restore it reads the content of the ZIP file. If your panel uses something else (SQLite or plain PostgreSQL), the script tells you it is unsupported and stops.
 
 ### Backup mode (options 1 and 2)
 The script asks: *Stop Pasarguard & PG-Node during backup?*
@@ -132,7 +132,7 @@ Follow the steps in order.
 
 #### Step 0: Before you start
 - Lower the **TTL** of your domain's A record to 60-300 seconds (a day earlier if possible). The DNS switch will be much faster.
-- Note down: your database type (TimescaleDB or MySQL), your PasarGuard version, and whether you use PG-Node.
+- Note down: your database type (TimescaleDB, MySQL or MariaDB), your PasarGuard version, and whether you use PG-Node.
 
 #### Step 1: Prepare the NEW server (clean install, no domain)
 Install a fresh PasarGuard with the **same database type** as the old server. Don't configure a domain or SSL and don't create an admin. Just install it and let it run on the server IP. Everything gets replaced by the backup anyway.
@@ -146,6 +146,11 @@ MySQL:
 ```bash
 curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh -o /tmp/pg.sh \
   && sudo bash /tmp/pg.sh install --database mysql
+```
+MariaDB:
+```bash
+curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh -o /tmp/pg.sh \
+  && sudo bash /tmp/pg.sh install --database mariadb
 ```
 If you use PG-Node on this server too, install it as well:
 ```bash
@@ -251,6 +256,13 @@ docker compose up -d mysql
 docker compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "DROP DATABASE IF EXISTS pasarguard; CREATE DATABASE pasarguard;"'
 cat pg_dump/db_backup.sql | docker compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" pasarguard'
 ```
+MariaDB: same as MySQL, but the service is called `mariadb` and the client is `mariadb` (newer images do not have the `mysql` command). If the password variable is empty inside the container, use the value of `MYSQL_ROOT_PASSWORD` (or `MARIADB_ROOT_PASSWORD`) from `.env`:
+```bash
+cd /opt/pasarguard
+docker compose up -d mariadb
+docker compose exec -T mariadb sh -c 'mariadb -uroot -p"${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" -e "DROP DATABASE IF EXISTS pasarguard; CREATE DATABASE pasarguard;"'
+cat pg_dump/db_backup.sql | docker compose exec -T mariadb sh -c 'mariadb -uroot -p"${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" pasarguard'
+```
 
 Start everything:
 ```bash
@@ -276,7 +288,7 @@ docker ps
 
 ### امکانات
 - بکاپ کامل پاسارگاد و PG-Node (تنظیمات، دیتا و دیتابیس)
-- پشتیبانی از **TimescaleDB (PostgreSQL)** و **MySQL** و **تشخیص خودکار دیتابیس** (بدون هیچ سؤالی)
+- پشتیبانی از **TimescaleDB (PostgreSQL)** و **MySQL** و **MariaDB** و **تشخیص خودکار دیتابیس** (بدون هیچ سؤالی)
 - اگر خروجی گرفتن از دیتابیس خطا بدهد، بکاپ متوقف می‌شود تا بکاپ خالی نگیری
 - انتقال یک‌مرحله‌ای به سرور جدید از طریق SSH
 - **ربات تلگرام + زمان‌بندی روزانه:** انتخاب اینکه روزی چند بار و چه ساعتی بکاپ بفرستد، هم از ترمینال و هم از داخل ربات. کرون‌جاب خودکار ساخته و به‌روز می‌شود و روی سرور فقط آخرین بکاپ می‌ماند
@@ -326,7 +338,7 @@ teperbk
 | ۵ | **آپدیت** | دانلود آخرین نسخه از گیتهاب |
 | ۶ | خروج | |
 
-نوع دیتابیس **خودکار تشخیص داده می‌شود**: برای بکاپ از سرویس‌های `/opt/pasarguard/docker-compose.yml` و برای ریستور از محتوای فایل ZIP. اگر پنل تو از چیز دیگری استفاده می‌کند (SQLite، MariaDB یا PostgreSQL ساده)، اسکریپت می‌گوید پشتیبانی نمی‌شود و متوقف می‌شود.
+نوع دیتابیس **خودکار تشخیص داده می‌شود**: برای بکاپ از سرویس‌های `/opt/pasarguard/docker-compose.yml` و برای ریستور از محتوای فایل ZIP. اگر پنل تو از چیز دیگری استفاده می‌کند (SQLite یا PostgreSQL ساده)، اسکریپت می‌گوید پشتیبانی نمی‌شود و متوقف می‌شود.
 
 ### حالت بکاپ (گزینه‌های ۱ و ۲)
 اسکریپت می‌پرسد: *Stop Pasarguard & PG-Node during backup?*
@@ -407,7 +419,7 @@ teperbk
 
 #### مرحله ۰: قبل از شروع
 - مقدار **TTL** رکورد A دامنه را روی ۶۰ تا ۳۰۰ ثانیه بگذار (اگر می‌شود یک روز زودتر). عوض کردن DNS بعداً خیلی سریع‌تر انجام می‌شود.
-- یادداشت کن: نوع دیتابیس (TimescaleDB یا MySQL)، نسخه پاسارگاد و اینکه PG-Node داری یا نه.
+- یادداشت کن: نوع دیتابیس (TimescaleDB، MySQL یا MariaDB)، نسخه پاسارگاد و اینکه PG-Node داری یا نه.
 
 #### مرحله ۱: آماده‌سازی سرور جدید (نصب خام، بدون دامنه)
 روی سرور جدید یک پاسارگاد تمیز نصب کن با **همان نوع دیتابیس** سرور قدیم. دامنه و SSL تنظیم نکن و ادمین نساز. فقط نصبش کن و با IP سرور بالا بیاید. همه‌چیز بعداً با بکاپ جایگزین می‌شود.
@@ -428,6 +440,16 @@ MySQL:
 ```bash
 curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh -o /tmp/pg.sh \
   && sudo bash /tmp/pg.sh install --database mysql
+```
+
+<div dir="rtl">
+
+MariaDB:
+</div>
+
+```bash
+curl -fsSL https://github.com/PasarGuard/scripts/raw/main/pasarguard.sh -o /tmp/pg.sh \
+  && sudo bash /tmp/pg.sh install --database mariadb
 ```
 
 <div dir="rtl">
@@ -567,6 +589,18 @@ cd /opt/pasarguard
 docker compose up -d mysql
 docker compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "DROP DATABASE IF EXISTS pasarguard; CREATE DATABASE pasarguard;"'
 cat pg_dump/db_backup.sql | docker compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" pasarguard'
+```
+
+<div dir="rtl">
+
+MariaDB (مثل MySQL است، فقط اسم سرویس `mariadb` است و کلاینت `mariadb` است، چون ایمیج‌های جدید دستور `mysql` ندارند):
+</div>
+
+```bash
+cd /opt/pasarguard
+docker compose up -d mariadb
+docker compose exec -T mariadb sh -c 'mariadb -uroot -p"${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" -e "DROP DATABASE IF EXISTS pasarguard; CREATE DATABASE pasarguard;"'
+cat pg_dump/db_backup.sql | docker compose exec -T mariadb sh -c 'mariadb -uroot -p"${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" pasarguard'
 ```
 
 <div dir="rtl">
