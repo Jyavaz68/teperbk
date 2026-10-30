@@ -18,6 +18,8 @@ Backup, restore & server migration tool for **PasarGuard** and **PG-Node**.
 - **Jalali (Shamsi) dates:** plan a one-time backup for an exact Jalali date and time from the bot
 - **Files up to 2 GB** (optional local Bot API server) instead of the 50 MB Telegram bot limit
 - **One-click update** from GitHub (menu option 5 or `teperbk --update`)
+- **Universal Tools (option 6):** all five databases (SQLite, PostgreSQL, TimescaleDB, MySQL, MariaDB), restore of official PasarGuard backups (split backups too), and database engine conversion with the official PasarGuard migration tool
+- **Safer scheduled backups:** every backup is verified, the number of kept backups is configurable, optional HTTP/SOCKS5 proxy for Telegram, free-disk check, and automatic retries with growing delay after a failure
 - Manual local backup and restore
 - **Test / Final backup mode:** choose whether services are stopped during the backup
 
@@ -49,9 +51,10 @@ teperbk
 | 3 | Manual Restore | Restore from a local ZIP (wipes the current setup) |
 | 4 | **Telegram Bot & Daily Schedule** | Permanent daily backups with cron + a bot you control from Telegram (recommended) |
 | 5 | **Update** | Download the latest version from GitHub |
-| 6 | Exit | |
+| 6 | **Universal Tools** | All databases, official PasarGuard backups, database conversion |
+| 7 | Exit | |
 
-The database type is **detected automatically**: for backups it reads the services in `/opt/pasarguard/docker-compose.yml`, and for restore it reads the content of the ZIP file. If your panel uses something else (SQLite or plain PostgreSQL), the script tells you it is unsupported and stops.
+The database type is **detected automatically**: for backups it reads the services in `/opt/pasarguard/docker-compose.yml`, and for restore it reads the content of the ZIP file. Options 1-3 work with TimescaleDB, MySQL and MariaDB. If your panel uses **SQLite or plain PostgreSQL**, they tell you to use option 6 (Universal Tools); the Telegram scheduler (option 4) handles those two automatically.
 
 ### Backup mode (options 1 and 2)
 The script asks: *Stop Pasarguard & PG-Node during backup?*
@@ -97,6 +100,14 @@ Only your admin ID can use the bot. Everyone else is ignored.
 
 When you change the schedule in the bot (or from the terminal menu), the cron job on the server is rewritten automatically.
 
+#### Extra safety (added in 1.2.0)
+- **Verification:** each new backup is read back before it is accepted: archive integrity (CRC), database dump present and not empty, and the dump's end marker. A backup that fails is deleted and **your older backups stay untouched**; you get a message.
+- **Keep N backups:** keep the last 1 to 30 backups on the server (`/keep 3` in the bot, or `teperbk` → 4 → 8). Default is 1, like before.
+- **Disk check:** the backup is skipped (with a message) if the disk does not have enough free space for the temporary copy and the archive.
+- **Retry with growing delay:** after a failure the bot retries after 15 min, 30 min, 1 h ... up to 6 h. You are told about the 1st failure and then every 3rd one, and when backups work again. The bot service must be running for retries.
+- **Telegram proxy:** `teperbk` → 4 → 8 → 2 accepts `socks5://host:port`, `socks5://user:pass@host:port` or `http://host:port`. It is used only for the normal Telegram server (not for the local 2 GB server).
+- **Backup engine:** `auto` (default) uses the built-in backup for TimescaleDB, MySQL and MariaDB and the **official** `pasarguard backup` for SQLite and PostgreSQL. `official` uses the official backup for every database.
+
 #### How it behaves
 - **No downtime:** scheduled backups never stop PasarGuard or PG-Node.
 - **Only the latest backup stays on the server** in `/opt/teperbk/backups`. Older ones are deleted only after the new backup was created successfully, so a failed run never leaves you with nothing.
@@ -118,6 +129,25 @@ Telegram's normal bot API limits uploads to 50 MB. To send up to 2 GB in one fil
 3. To go back: the same menu item switches it off. After that, the bot needs about **10 minutes** before it answers again (a Telegram rule when moving a bot between servers).
 
 Notes: the container image is a third-party image from Docker Hub, and it handles your bot token, so use it only if you trust it. This mode is optional and off by default. If anything fails, normal 50 MB mode with split parts keeps working.
+
+---
+
+### Universal Tools (option 6)
+
+These tools follow the official PasarGuard documentation and tools ([docs.pasarguard.org](https://docs.pasarguard.org)). They do not change how options 1-5 work.
+
+1. **Backup now (official).** Runs `pasarguard backup`, which works for SQLite, PostgreSQL, TimescaleDB, MySQL and MariaDB. The archive is verified and a copy is kept in `/opt/teperbk/backups`. You can send it to your Telegram bot right away.
+2. **Restore a PasarGuard backup.** For archives made by `pasarguard backup` or its Telegram backup service, any database, **split (multi-part) backups too**. It lists the archives it finds (`/root`, the current folder, `/opt/pasarguard/backup`, `/opt/teperbk/backups`) or takes a full path, runs `pasarguard restore <file> --check`, and then restores with the official command: normal mode if a panel is already installed here, `--fresh` mode on a clean new server. You must type `RESTORE` to confirm.
+3. **Convert the database engine.** For example MariaDB → TimescaleDB or SQLite → PostgreSQL, using the official [db-migrations](https://github.com/PasarGuard/db-migrations) tool. The wizard:
+   - takes the data from a backup archive (teperbk or official), a database file or dump, or a live database URL;
+   - reads the target from the panel installed on this server (`.env`) or from a URL you type, and checks that the target is reachable;
+   - asks you to confirm three times (backup done, same version and tables created, and typing `MIGRATE`);
+   - runs the official tool. PostgreSQL dump files must go through the official tool's own menu, so the wizard prints the exact answers to type.
+
+   Official flow, in short: back up the source → install PasarGuard on the **target** database with the **same app version** and start it once (so it creates its tables) → run the conversion → check users and settings in the panel. The target database is erased before the data is copied.
+4. **Documentation links.**
+
+Requirements: the official `pasarguard` command (the script offers to install it with `install-script`), and for conversion `git` plus network access (the official tool installs its own dependencies).
 
 ---
 
@@ -295,6 +325,8 @@ docker ps
 - **تاریخ شمسی:** زمان‌بندی یک بکاپ تک‌باره در تاریخ و ساعت دقیق شمسی از داخل ربات
 - **ارسال فایل تا ۲ گیگابایت** (با سرور محلی Bot API، اختیاری) به جای محدودیت ۵۰ مگابایتی ربات‌های تلگرام
 - **آپدیت با یک گزینه** از گیتهاب (گزینه ۵ منو یا `teperbk --update`)
+- **ابزارهای جامع (گزینه ۶):** هر پنج دیتابیس (SQLite، PostgreSQL، TimescaleDB، MySQL، MariaDB)، ریستور بکاپ‌های رسمی پاسارگاد (حتی تکه‌تکه) و تبدیل نوع دیتابیس با ابزار رسمی مهاجرت پاسارگاد
+- **بکاپ زمان‌بندی‌شده امن‌تر:** بررسی هر بکاپ، تعداد قابل‌تنظیم بکاپ نگه‌داشته‌شده، پراکسی اختیاری HTTP/SOCKS5 برای تلگرام، چک فضای دیسک و تلاش مجدد خودکار با فاصله رو به افزایش بعد از خطا
 - بکاپ و ریستور دستی (لوکال)
 - **حالت تست / نهایی:** انتخاب اینکه سرویس‌ها حین بکاپ خاموش بشن یا نه
 
@@ -336,9 +368,10 @@ teperbk
 | ۳ | ریستور دستی | ریستور از زیپ لوکال (تنظیمات فعلی پاک می‌شود) |
 | ۴ | **ربات تلگرام و زمان‌بندی روزانه** | بکاپ دائمی روزانه با کرون‌جاب + رباتی که از تلگرام کنترلش می‌کنی (پیشنهادی) |
 | ۵ | **آپدیت** | دانلود آخرین نسخه از گیتهاب |
-| ۶ | خروج | |
+| ۶ | **ابزارهای جامع** | همه دیتابیس‌ها، بکاپ‌های رسمی پاسارگاد، تبدیل دیتابیس |
+| ۷ | خروج | |
 
-نوع دیتابیس **خودکار تشخیص داده می‌شود**: برای بکاپ از سرویس‌های `/opt/pasarguard/docker-compose.yml` و برای ریستور از محتوای فایل ZIP. اگر پنل تو از چیز دیگری استفاده می‌کند (SQLite یا PostgreSQL ساده)، اسکریپت می‌گوید پشتیبانی نمی‌شود و متوقف می‌شود.
+نوع دیتابیس **خودکار تشخیص داده می‌شود**: برای بکاپ از سرویس‌های `/opt/pasarguard/docker-compose.yml` و برای ریستور از محتوای فایل ZIP. گزینه‌های ۱ تا ۳ با TimescaleDB، MySQL و MariaDB کار می‌کنند. اگر پنل تو **SQLite یا PostgreSQL ساده** باشد، می‌گویند از گزینه ۶ (ابزارهای جامع) استفاده کن؛ بکاپ زمان‌بندی‌شده تلگرام (گزینه ۴) این دو را خودکار پوشش می‌دهد.
 
 ### حالت بکاپ (گزینه‌های ۱ و ۲)
 اسکریپت می‌پرسد: *Stop Pasarguard & PG-Node during backup?*
@@ -384,6 +417,14 @@ teperbk
 
 وقتی زمان‌بندی را در ربات (یا از منوی ترمینال) عوض کنی، کرون‌جاب روی سرور خودکار دوباره نوشته می‌شود.
 
+#### ایمنی بیشتر (از نسخه ۱.۲.۰)
+- **بررسی بکاپ:** هر بکاپ جدید قبل از پذیرفتن خوانده و چک می‌شود: سالم بودن آرشیو (CRC)، وجود دامپ دیتابیس و خالی نبودنش، و نشانه پایان دامپ. بکاپی که رد شود پاک می‌شود و **بکاپ‌های قبلی دست‌نخورده می‌مانند**؛ پیام هم می‌گیری.
+- **نگه‌داری N بکاپ:** آخرین ۱ تا ۳۰ بکاپ روی سرور می‌ماند (`/keep 3` در ربات یا `teperbk` ← ۴ ← ۸). پیش‌فرض ۱ است، مثل قبل.
+- **چک دیسک:** اگر فضای خالی برای کپی موقت و آرشیو کافی نباشد، بکاپ انجام نمی‌شود و پیام می‌گیری.
+- **تلاش مجدد با فاصله رو به افزایش:** بعد از خطا بعد از ۱۵ دقیقه، ۳۰ دقیقه، ۱ ساعت ... تا ۶ ساعت دوباره تلاش می‌کند. خطای اول و بعد هر خطای سوم و همین‌طور سالم شدن دوباره به تو اطلاع داده می‌شود. برای تلاش مجدد سرویس ربات باید روشن باشد.
+- **پراکسی تلگرام:** `teperbk` ← ۴ ← ۸ ← ۲ آدرس‌هایی مثل `socks5://host:port`، `socks5://user:pass@host:port` یا `http://host:port` را می‌پذیرد. فقط برای سرور معمولی تلگرام استفاده می‌شود (نه سرور محلی ۲ گیگابایتی).
+- **موتور بکاپ:** حالت `auto` (پیش‌فرض) برای TimescaleDB، MySQL و MariaDB بکاپ داخلی و برای SQLite و PostgreSQL بکاپ **رسمی** `pasarguard backup` را استفاده می‌کند. حالت `official` برای همه دیتابیس‌ها بکاپ رسمی می‌گیرد.
+
 #### رفتار سیستم
 - **بدون قطعی:** بکاپ زمان‌بندی‌شده هیچ‌وقت پاسارگاد و PG-Node را خاموش نمی‌کند.
 - **فقط آخرین بکاپ روی سرور می‌ماند** (در `/opt/teperbk/backups`). نسخه‌های قدیمی فقط بعد از ساخته شدن موفق بکاپ جدید پاک می‌شوند، پس اگر یک اجرا خطا بدهد چیزی را از دست نمی‌دهی.
@@ -405,6 +446,25 @@ teperbk
 ۳. برای برگشت: همان گزینه منو آن را خاموش می‌کند. بعد از آن حدود **۱۰ دقیقه** طول می‌کشد تا ربات دوباره جواب بدهد (قانون تلگرام هنگام جابه‌جایی ربات بین سرورها).
 
 نکته: ایمیج کانتینر یک ایمیج شخص ثالث از Docker Hub است و با توکن ربات کار می‌کند، پس فقط اگر اعتماد داری استفاده کن. این حالت اختیاری و پیش‌فرض خاموش است. اگر مشکلی پیش بیاید، حالت عادی ۵۰ مگابایتی با ارسال تکه‌تکه همچنان کار می‌کند.
+
+---
+
+### ابزارهای جامع (گزینه ۶)
+
+این ابزارها از مستندات و ابزارهای رسمی پاسارگاد ([docs.pasarguard.org](https://docs.pasarguard.org)) پیروی می‌کنند و روش کار گزینه‌های ۱ تا ۵ را تغییر نمی‌دهند.
+
+۱. **بکاپ همین الان (رسمی).** دستور `pasarguard backup` را اجرا می‌کند که برای SQLite، PostgreSQL، TimescaleDB، MySQL و MariaDB کار می‌کند. آرشیو بررسی می‌شود و یک کپی در `/opt/teperbk/backups` می‌ماند. می‌توانی همان لحظه برای ربات تلگرامت بفرستی.
+۲. **ریستور بکاپ پاسارگاد.** برای آرشیوهایی که با `pasarguard backup` یا سرویس بکاپ تلگرامی خود پاسارگاد ساخته شده‌اند، هر نوع دیتابیس، **حتی بکاپ‌های تکه‌تکه (چندبخشی)**. آرشیوهای پیداشده (`/root`، پوشه فعلی، `/opt/pasarguard/backup` و `/opt/teperbk/backups`) را لیست می‌کند یا مسیر کامل می‌گیرد، `pasarguard restore <file> --check` را اجرا می‌کند و بعد با دستور رسمی ریستور می‌کند: اگر اینجا پنل نصب باشد حالت عادی و روی سرور جدید و تمیز حالت `--fresh`. برای تأیید باید `RESTORE` را تایپ کنی.
+۳. **تبدیل نوع دیتابیس.** مثلاً MariaDB به TimescaleDB یا SQLite به PostgreSQL، با ابزار رسمی [db-migrations](https://github.com/PasarGuard/db-migrations). ویزارد:
+   - داده را از آرشیو بکاپ (teperbk یا رسمی)، فایل یا دامپ دیتابیس یا آدرس دیتابیس زنده می‌گیرد؛
+   - مقصد را از پنل نصب‌شده روی همین سرور (`.env`) یا از آدرسی که تایپ می‌کنی می‌خواند و در دسترس بودنش را چک می‌کند؛
+   - سه بار تأیید می‌گیرد (بکاپ گرفته‌ای، نسخه یکی است و جدول‌ها ساخته شده‌اند، و تایپ `MIGRATE`)؛
+   - ابزار رسمی را اجرا می‌کند. فایل دامپ PostgreSQL باید از منوی خود ابزار رسمی انتخاب شود، پس ویزارد جواب‌های دقیق را چاپ می‌کند.
+
+   روند رسمی، خلاصه: از مبدأ بکاپ بگیر ← پاسارگاد را روی دیتابیس **مقصد** و با **همان نسخه برنامه** نصب کن و یک بار بالا بیاور (تا جدول‌ها ساخته شوند) ← تبدیل را اجرا کن ← کاربرها و تنظیمات را در پنل چک کن. دیتابیس مقصد قبل از کپی داده پاک می‌شود.
+۴. **لینک‌های مستندات.**
+
+پیش‌نیاز: دستور رسمی `pasarguard` (اسکریپت پیشنهاد می‌دهد با `install-script` نصبش کند) و برای تبدیل `git` و دسترسی به اینترنت (ابزار رسمی وابستگی‌هایش را خودش نصب می‌کند).
 
 ---
 

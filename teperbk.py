@@ -21,8 +21,13 @@ import tempfile
 import fcntl
 import http.client
 import urllib.parse
+import base64
+import ssl
+import struct
+import hashlib
+import tarfile
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 UPDATE_URL = "https://raw.githubusercontent.com/jyavaz68/teperbk/main/teperbk.py"
 
 class Colors:
@@ -698,9 +703,10 @@ def _file_not_empty(path):
     except OSError:
         return False
 
-def detect_db_type_local():
+def detect_db_type_local(allow_extended=False):
     """Detect the database used by the local Pasarguard installation
-    by reading the services defined in /opt/pasarguard/docker-compose.yml."""
+    by reading the services defined in /opt/pasarguard/docker-compose.yml.
+    SQLite and plain PostgreSQL are returned only when allow_extended=True (universal tools)."""
     compose_file = os.path.join(PASARGUARD_DIR, "docker-compose.yml")
     if not os.path.isfile(compose_file):
         print_error(f"Cannot find {compose_file}. Is Pasarguard installed on this server?")
@@ -729,9 +735,22 @@ def detect_db_type_local():
 
     db_url = _read_env_var(os.path.join(PASARGUARD_DIR, ".env"), "SQLALCHEMY_DATABASE_URL") or ""
     scheme = db_url.split("://", 1)[0] if "://" in db_url else "unknown"
+
+    extended = None
+    if scheme.startswith("sqlite"):
+        extended = ("sqlite", "SQLite")
+    elif scheme.startswith("postgresql") or any(x in services for x in ("postgres", "postgresql")):
+        extended = ("postgresql", "PostgreSQL")
+    if extended:
+        if allow_extended:
+            print_success(f"Detected database: {extended[1]}")
+            return extended[0]
+        print_warning(f"Detected database: {extended[1]}. It is handled by option 6 (Universal Tools: all databases).")
+        return None
+
     print_error("Unsupported or undetected database.")
     print_error(f"Compose services: {', '.join(services) if services else 'none'} | DB driver in .env: {scheme}")
-    print_error("This tool supports only TimescaleDB, MySQL and MariaDB (running as docker compose services).")
+    print_error("Supported: TimescaleDB, PostgreSQL, MySQL, MariaDB and SQLite.")
     return None
 
 def detect_db_type_from_zip(zip_path):
@@ -1394,6 +1413,12 @@ DEFAULT_CONFIG = {
     "api_base": "",
     "api_id": "",
     "api_hash": "",
+    "proxy": "",
+    "keep_backups": 1,
+    "backup_engine": "auto",
+    "backup_sets": [],
+    "fail_count": 0,
+    "retry_at": 0,
 }
 
 BOT_AWAITING = {}   # chat_id -> "times" | "once" while the bot waits for the admin's next message
@@ -1437,6 +1462,15 @@ BOT_STR = {
         "off": "missing ❌",
         "cancelled": "Cancelled.",
         "lang_set": "✅ Language set to English.",
+        "disk_fail": "❌ Backup skipped: not enough free disk space.\n{detail}",
+        "verify_fail": "❌ The new backup failed verification and was deleted (your older backups are untouched):\n{detail}",
+        "retry_note": "🔁 Failure #{n}. Next automatic retry in about {mins} minutes.",
+        "recovered": "✅ Backups work again.",
+        "keep_ok": "✅ The last {n} backup(s) will be kept on the server.",
+        "keep_bad": "❌ Send a number between 1 and 30. Example: /keep 3",
+        "status_extra": "💾 Kept on server: last {keep} backup(s)\n🧰 Backup engine: {engine}\n🌐 Proxy: {proxy}{fails}",
+        "fails_line": "\n⚠️ Failed runs in a row: {n}",
+        "sha_line": "🔐 SHA256: {sha}",
     },
     "fa": {
         "menu": "🤖 teperbk - بکاپ پاسارگاد\nیکی از گزینه‌ها را انتخاب کن:",
@@ -1476,6 +1510,15 @@ BOT_STR = {
         "off": "وجود ندارد ❌",
         "cancelled": "لغو شد.",
         "lang_set": "✅ زبان روی فارسی تنظیم شد.",
+        "disk_fail": "❌ بکاپ انجام نشد: فضای خالی دیسک کافی نیست.\n{detail}",
+        "verify_fail": "❌ بکاپ جدید در بررسی رد شد و پاک شد (بکاپ‌های قبلی دست‌نخورده‌اند):\n{detail}",
+        "retry_note": "🔁 خطای شماره {n}. تلاش مجدد خودکار حدود {mins} دقیقه دیگر.",
+        "recovered": "✅ بکاپ‌گیری دوباره سالم کار می‌کند.",
+        "keep_ok": "✅ آخرین {n} بکاپ روی سرور نگه داشته می‌شود.",
+        "keep_bad": "❌ یک عدد بین ۱ تا ۳۰ بفرست. مثال: /keep 3",
+        "status_extra": "💾 نگه‌داری روی سرور: آخرین {keep} بکاپ\n🧰 موتور بکاپ: {engine}\n🌐 پراکسی: {proxy}{fails}",
+        "fails_line": "\n⚠️ تعداد خطاهای پشت‌سرهم: {n}",
+        "sha_line": "🔐 SHA256: {sha}",
     },
 }
 
@@ -1525,12 +1568,101 @@ def server_timezone():
     return datetime.datetime.now().astimezone().strftime("%Z (UTC%z)")
 
 # ------------------------------------------------------------- telegram ----
-def api_base_for(token):
-    """Local Bot API server (2 GB files) is used only for the configured bot."""
+# ---------------------------------------------------- proxy-aware network ----
+def _recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise OSError("proxy closed the connection")
+        data += chunk
+    return data
+
+def _socks5_connect(sock, host, port, user=None, password=None):
+    sock.sendall(b"\x05\x02\x00\x02" if user else b"\x05\x01\x00")
+    resp = _recv_exact(sock, 2)
+    if resp[0] != 5:
+        raise OSError("not a SOCKS5 proxy")
+    if resp[1] == 2:
+        if not user:
+            raise OSError("SOCKS5 proxy requires a username and password")
+        u, p = user.encode(), (password or "").encode()
+        sock.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+        if _recv_exact(sock, 2)[1] != 0:
+            raise OSError("SOCKS5 authentication failed")
+    elif resp[1] != 0:
+        raise OSError("SOCKS5 proxy refused the login method")
+    host_b = host.encode("idna")
+    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + struct.pack(">H", port))
+    reply = _recv_exact(sock, 4)
+    if reply[1] != 0:
+        raise OSError(f"SOCKS5 connect failed (code {reply[1]})")
+    if reply[3] == 1:
+        _recv_exact(sock, 6)
+    elif reply[3] == 4:
+        _recv_exact(sock, 18)
+    elif reply[3] == 3:
+        _recv_exact(sock, _recv_exact(sock, 1)[0] + 2)
+
+def _http_connect(sock, host, port, user=None, password=None):
+    req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+    if user:
+        token = base64.b64encode(f"{user}:{password or ''}".encode()).decode()
+        req += f"Proxy-Authorization: Basic {token}\r\n"
+    sock.sendall((req + "\r\n").encode())
+    data = b""
+    while b"\r\n\r\n" not in data and len(data) < 65536:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise OSError("proxy closed the connection")
+        data += chunk
+    status = data.split(b"\r\n", 1)[0].decode(errors="replace")
+    if " 200" not in status:
+        raise OSError(f"proxy refused the tunnel: {status}")
+
+def open_proxy_socket(proxy_url, host, port, timeout):
+    p = urllib.parse.urlparse(proxy_url)
+    if not p.hostname or not p.port:
+        raise OSError("invalid proxy address (example: socks5://127.0.0.1:1080)")
+    if p.scheme not in ("socks5", "socks5h", "http", "https"):
+        raise OSError("proxy must start with http:// or socks5://")
+    user = urllib.parse.unquote(p.username) if p.username else None
+    password = urllib.parse.unquote(p.password) if p.password else None
+    sock = socket.create_connection((p.hostname, p.port), timeout=timeout)
+    try:
+        if p.scheme in ("socks5", "socks5h"):
+            _socks5_connect(sock, host, port, user, password)
+        elif p.scheme in ("http", "https"):
+            _http_connect(sock, host, port, user, password)
+        else:
+            raise OSError("proxy must start with http:// or socks5://")
+    except Exception:
+        sock.close()
+        raise
+    return sock
+
+def make_connection(url, timeout, proxy=None):
+    u = urllib.parse.urlparse(url)
+    use_https = u.scheme == "https"
+    port = u.port or (443 if use_https else 80)
+    conn_class = http.client.HTTPSConnection if use_https else http.client.HTTPConnection
+    conn = conn_class(u.hostname, port, timeout=timeout)
+    if proxy:
+        sock = open_proxy_socket(proxy, u.hostname, port, timeout)
+        if use_https:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+        conn.sock = sock
+    return conn
+
+def tg_route(token):
+    """(base_url, proxy) for a bot token. The proxy is used only for the normal Telegram cloud API."""
     cfg = load_config()
     if cfg.get("large_files") and cfg.get("api_base") and cfg.get("bot_token") == token:
-        return cfg["api_base"]
-    return CLOUD_API
+        return cfg["api_base"], None
+    return CLOUD_API, (cfg.get("proxy") or None)
+
+def api_base_for(token):
+    return tg_route(token)[0]
 
 def tg_limits(cfg):
     if cfg.get("large_files") and cfg.get("api_base"):
@@ -1538,17 +1670,23 @@ def tg_limits(cfg):
     return CLOUD_MAX_BYTES, CLOUD_PART_BYTES
 
 def tg_api(token, method, params=None, timeout=30, base=None):
-    url = f"{base or api_base_for(token)}/bot{token}/{method}"
-    data = json.dumps(params or {}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    route_base, proxy = tg_route(token)
+    base = base or route_base
+    if base != CLOUD_API:
+        proxy = None
+    body = json.dumps(params or {}).encode("utf-8")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
+        conn = make_connection(base, timeout, proxy)
         try:
-            return json.loads(e.read().decode("utf-8"))
-        except Exception:
-            return {"ok": False, "description": f"HTTP {e.code}"}
+            conn.request("POST", f"/bot{token}/{method}", body=body, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8", "replace")
+        finally:
+            conn.close()
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {"ok": False, "description": f"HTTP {resp.status}"}
     except Exception as e:
         return {"ok": False, "description": str(e).replace(token, "***")}
 
@@ -1563,7 +1701,7 @@ def send_telegram_file(token, chat_id, file_path, caption=""):
     if not os.path.exists(file_path):
         return False, "File not found"
 
-    base = urllib.parse.urlparse(api_base_for(token))
+    base_url, proxy = tg_route(token)
     boundary = f"----teperbk{uuid.uuid4().hex}"
     file_name = os.path.basename(file_path)
     size = os.path.getsize(file_path)
@@ -1578,10 +1716,10 @@ def send_telegram_file(token, chat_id, file_path, caption=""):
              f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
     tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
 
-    conn_class = http.client.HTTPSConnection if base.scheme == "https" else http.client.HTTPConnection
     timeout = 900 if size <= CLOUD_MAX_BYTES else 7200
-    conn = conn_class(base.hostname, base.port, timeout=timeout)
+    conn = None
     try:
+        conn = make_connection(base_url, timeout, proxy)
         conn.putrequest("POST", f"/bot{token}/sendDocument")
         conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
         conn.putheader("Content-Length", str(len(head) + size + len(tail)))
@@ -1602,7 +1740,8 @@ def send_telegram_file(token, chat_id, file_path, caption=""):
     except Exception as e:
         return False, f"Connection error: {str(e).replace(token, '***')}"
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 # ----------------------------------------------------- times & cron job ----
 def parse_times(text):
@@ -1827,12 +1966,14 @@ def _send_with_retry(token, chat_id, path, caption, attempts=3):
             time.sleep(15)
     return False, details
 
-def send_backup_to_telegram(cfg, zip_path, db_type):
+def send_backup_to_telegram(cfg, zip_path, db_type, extra_caption=""):
     token, chat_id, lang = cfg["bot_token"], cfg["admin_chat_id"], cfg.get("lang", "fa")
     max_bytes, part_bytes = tg_limits(cfg)
     size = os.path.getsize(zip_path)
     caption = bot_t(lang, "caption", host=socket.gethostname(), db=db_type,
                     size=human_size(size), time=fmt_dt(time.time(), cfg))
+    if extra_caption:
+        caption += "\n" + extra_caption
     if size <= max_bytes:
         return _send_with_retry(token, chat_id, zip_path, caption)
 
@@ -1849,18 +1990,245 @@ def send_backup_to_telegram(cfg, zip_path, db_type):
     finally:
         shutil.rmtree(parts_dir, ignore_errors=True)
 
-def record_last_backup(ok, zip_path=None):
+# -------------------------------------------- verification, disk, retention ----
+OFFICIAL_BACKUP_DIR = "/opt/pasarguard/backup"
+OFFICIAL_SCRIPT_URL = "https://raw.githubusercontent.com/PasarGuard/scripts/main/pasarguard.sh"
+_DUMP_END_MARKERS = (b"PostgreSQL database dump complete", b"Dump completed on")
+_MULTIPART_RE = re.compile(r"(\.part\d+|\.z\d+|\.\d{3})(\.zip)?$", re.I)
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(4 * MB), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def verify_archive(path, required_members=None):
+    """Check that a backup archive is complete. Returns (ok, problems, warnings, sha256)."""
+    problems, warnings = [], []
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return False, ["the archive is missing or empty"], [], ""
+    name = os.path.basename(path)
+    members = {}   # member name -> size
+    tails = {}     # .sql member -> last bytes
+
+    def scan(name_, stream, size):
+        members[name_] = size
+        is_sql = name_.lower().endswith(".sql")
+        tail = b""
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            if is_sql:
+                tail = (tail + chunk)[-8192:]
+        if is_sql:
+            tails[name_] = tail
+
+    try:
+        if _MULTIPART_RE.search(name):
+            warnings.append("multi-part archive: the content cannot be checked part by part")
+        elif zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as z:
+                for info in z.infolist():
+                    if not info.is_dir():
+                        with z.open(info) as stream:     # the CRC is verified when the entry is read to its end
+                            scan(info.filename, stream, info.file_size)
+        elif tarfile.is_tarfile(path):
+            with tarfile.open(path, "r:*") as tf:
+                for m in tf:
+                    if m.isfile():
+                        scan(m.name, tf.extractfile(m), m.size)
+        else:
+            problems.append("the file is not a valid ZIP or tar archive")
+    except Exception as e:
+        problems.append(f"the archive is damaged: {e}")
+
+    if not problems and members:
+        payload = [n for n, sz in members.items() if sz > 0 and n.lower().endswith((".sql", ".sqlite", ".sqlite3", ".db"))]
+        if not payload:
+            problems.append("no database dump or database file was found inside")
+        for req in (required_members or []):
+            if members.get(req, 0) <= 0:
+                problems.append(f"required file is missing or empty: {req}")
+        for n, tail in tails.items():
+            if members.get(n, 0) > 0 and not n.lower().endswith("globals.sql") and not any(m in tail for m in _DUMP_END_MARKERS):
+                warnings.append(f"{n}: the end-of-dump marker was not found (the dump may be incomplete)")
+    elif not problems and not _MULTIPART_RE.search(name):
+        problems.append("the archive contains no files")
+
+    return (not problems), problems, warnings, sha256_file(path)
+
+def dir_size(path):
+    total = 0
+    for dirpath, _dirs, files in os.walk(path, onerror=lambda e: None):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, f)).st_size
+            except OSError:
+                pass
+    return total
+
+def check_disk_space(cfg, official=False):
+    """Make sure the disk has room for the staging copy and the archive. Returns (ok, message)."""
+    est = sum(dir_size(d) for d in ("/var/lib/pasarguard", "/opt/pg-node", "/var/lib/pg-node") if os.path.isdir(d))
+    last = (cfg.get("last_backup") or {}).get("size", 0) or 0
+    need = int((est + max(100 * MB, last * 3)) * 1.1) + 100 * MB
+    out_dir = OFFICIAL_BACKUP_DIR if official else BACKUP_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    needs = {}
+    for p in ("/tmp", out_dir):
+        needs.setdefault(os.stat(p).st_dev, [p, 0])[1] += need
+    problems = []
+    for _dev, (p, total) in needs.items():
+        free = shutil.disk_usage(p).free
+        if free < total:
+            problems.append(f"{p}: free {human_size(free)}, needed about {human_size(total)}")
+    return (not problems), "; ".join(problems)
+
+def register_and_prune(new_files, keep_n):
+    """Remember this backup, keep only the newest keep_n backups, delete the rest. Returns removed count."""
+    names = [os.path.basename(f) for f in new_files]
+    keep_n = max(1, min(30, int(keep_n or 1)))
+
+    def mutate(c):
+        sets = [x for x in (c.get("backup_sets") or []) if x.get("files")]
+        sets.append({"ts": time.time(), "files": names})
+        sets.sort(key=lambda x: x["ts"])
+        c["backup_sets"] = sets[-keep_n:]
+
+    cfg = update_config(mutate)
+    keep = {n for x in cfg["backup_sets"] for n in x["files"]}
+    removed = 0
+    for name in os.listdir(BACKUP_DIR):
+        p = os.path.join(BACKUP_DIR, name)
+        if name.startswith("backup_") and os.path.isfile(p) and name not in keep:
+            try:
+                os.remove(p)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+def record_last_backup(ok, zip_path=None, size=None, sha=None, engine=None):
     def mutate(cfg):
         cfg["last_backup"] = {
             "ts": time.time(),
             "ok": bool(ok),
             "file": os.path.basename(zip_path) if zip_path else "",
-            "size": os.path.getsize(zip_path) if zip_path and os.path.exists(zip_path) else 0,
+            "size": size if size is not None else (os.path.getsize(zip_path) if zip_path and os.path.exists(zip_path) else 0),
+            "sha256": sha or "",
+            "engine": engine or "",
         }
     update_config(mutate)
 
+def note_failure(key, **kw):
+    """Count the failure, schedule an automatic retry with growing delay, tell the admin (1st, 3rd, 6th... failure)."""
+    def mutate(c):
+        c["fail_count"] = int(c.get("fail_count") or 0) + 1
+        delay = min(15 * 60 * (2 ** (c["fail_count"] - 1)), 6 * 3600)
+        c["retry_at"] = time.time() + delay
+    cfg = update_config(mutate)
+    n = cfg["fail_count"]
+    if n == 1 or n % 3 == 0:
+        lang = cfg.get("lang", "fa")
+        mins = int(max(0, cfg["retry_at"] - time.time()) // 60) + 1
+        tg_send(cfg, bot_t(lang, key, **kw) + "\n" + bot_t(lang, "retry_note", n=n, mins=mins))
+
+def note_success():
+    cfg = load_config()
+    had_failures = int(cfg.get("fail_count") or 0) > 0
+    update_config(lambda c: c.update(fail_count=0, retry_at=0))
+    if had_failures:
+        tg_send(cfg, bot_t(cfg.get("lang", "fa"), "recovered"))
+
+# --------------------------------------------- official PasarGuard backup ----
+def pasarguard_cli():
+    return shutil.which("pasarguard")
+
+def ensure_pasarguard_cli(interactive=True):
+    """The official 'pasarguard' command (installed by the PasarGuard scripts)."""
+    if pasarguard_cli():
+        return True
+    if not interactive:
+        return False
+    print_warning("The official 'pasarguard' command is not installed on this server.")
+    print_info(f"It comes from the official PasarGuard scripts: {OFFICIAL_SCRIPT_URL}")
+    print_info("Only the command is installed (install-script). The panel itself is not touched.")
+    if not ask_yes_no("Install the official command now? (y/n): ", default=False):
+        return False
+    try:
+        req = urllib.request.Request(OFFICIAL_SCRIPT_URL, headers={"User-Agent": "teperbk"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            script = resp.read()
+    except Exception as e:
+        print_error(f"Could not download the official script: {e}")
+        return False
+    if not script.startswith(b"#!") or b"pasarguard" not in script:
+        print_error("The downloaded file does not look like the official script. Stopped.")
+        return False
+    path = os.path.join(tempfile.mkdtemp(prefix="teperbk_pg_"), "pasarguard.sh")
+    with open(path, "wb") as f:
+        f.write(script)
+    subprocess.run(["bash", path, "install-script"])
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+    return bool(pasarguard_cli())
+
+def _snapshot_dir(path):
+    snap = {}
+    try:
+        for name in os.listdir(path):
+            p = os.path.join(path, name)
+            if os.path.isfile(p):
+                st = os.stat(p)
+                snap[name] = (st.st_mtime, st.st_size)
+    except OSError:
+        pass
+    return snap
+
+def official_backup(timeout=7200):
+    """Run `pasarguard backup` (all databases) and link its new archive(s) into BACKUP_DIR.
+    Returns (files, error)."""
+    if not pasarguard_cli():
+        return [], "the official 'pasarguard' command is not installed"
+    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    before = _snapshot_dir(OFFICIAL_BACKUP_DIR)
+    print_info("Running the official PasarGuard backup (pasarguard backup)...")
+    try:
+        r = subprocess.run([pasarguard_cli(), "backup"], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return [], "pasarguard backup timed out"
+    tail = "\n".join((r.stdout + "\n" + r.stderr).strip().splitlines()[-15:])
+    if tail:
+        print(tail)
+    if r.returncode != 0:
+        return [], f"pasarguard backup failed (exit code {r.returncode})"
+    after = _snapshot_dir(OFFICIAL_BACKUP_DIR)
+    new = sorted(n for n, meta in after.items() if before.get(n) != meta and after[n][1] > 0)
+    if not new:
+        return [], f"no new archive appeared in {OFFICIAL_BACKUP_DIR}"
+    stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    files = []
+    for name in new:
+        dest = os.path.join(BACKUP_DIR, f"backup_official_{stamp}_{name}")
+        try:
+            os.link(os.path.join(OFFICIAL_BACKUP_DIR, name), dest)      # no extra disk space
+        except OSError:
+            shutil.copy2(os.path.join(OFFICIAL_BACKUP_DIR, name), dest)
+        os.chmod(dest, 0o600)
+        files.append(dest)
+    return files, None
+
+# -------------------------------------------------------- scheduled backup ----
+NATIVE_REQUIRED = {
+    "timescaledb": ["pg_dump/db-001.sql", "pg_dump/globals.sql"],
+    "mysql": ["pg_dump/db_backup.sql"],
+    "mariadb": ["pg_dump/db_backup.sql"],
+}
+
 def run_scheduled_backup(trigger="cron"):
-    """Backup (no downtime) -> keep only the newest ZIP on the server -> send to Telegram."""
+    """Backup (no downtime) -> verify -> keep the newest N -> send to Telegram."""
     cfg = load_config()
     print(f"\n===== teperbk {trigger} backup @ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====")
     if not is_configured(cfg):
@@ -1874,31 +2242,76 @@ def run_scheduled_backup(trigger="cron"):
         return False
 
     try:
-        db_type = detect_db_type_local()
-        if not db_type:
-            tg_send(cfg, bot_t(lang, "detect_fail", log=LOG_FILE))
+        engine = detect_db_type_local(allow_extended=True)
+        if not engine:
+            note_failure("detect_fail", log=LOG_FILE)
+            return False
+
+        official = engine in ("sqlite", "postgresql") or cfg.get("backup_engine") == "official"
+        ok_disk, disk_msg = check_disk_space(cfg, official=official)
+        if not ok_disk:
+            print_error(f"Not enough free disk space: {disk_msg}")
+            record_last_backup(False, engine=engine)
+            note_failure("disk_fail", detail=disk_msg)
             return False
 
         os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
-        zip_path = _create_backup_core(db_type, out_dir=BACKUP_DIR)
-        if not zip_path or not os.path.exists(zip_path):
-            record_last_backup(False)
-            tg_send(cfg, bot_t(lang, "backup_fail", log=LOG_FILE))
+        if official:
+            files, err = official_backup()
+            if err:
+                print_error(err)
+        else:
+            zip_path = _create_backup_core(engine, out_dir=BACKUP_DIR)
+            files = [zip_path] if zip_path and os.path.exists(zip_path) else []
+        if not files:
+            record_last_backup(False, engine=engine)
+            note_failure("backup_fail", log=LOG_FILE)
             return False
 
-        os.chmod(zip_path, 0o600)
-        removed = prune_old_backups(zip_path)
-        if removed:
-            print_info(f"Removed {removed} old backup file(s). Only the latest is kept.")
+        total_size, sha, warnings, problems = 0, "", [], []
+        for f in files:
+            os.chmod(f, 0o600)
+            ok_v, probs, warns, digest = verify_archive(f, None if official else NATIVE_REQUIRED.get(engine))
+            total_size += os.path.getsize(f)
+            sha = digest if len(files) == 1 else ""
+            warnings += warns
+            problems += probs
+            if not ok_v:
+                break
+        for w in warnings:
+            print_warning(w)
+        if problems:
+            for p in problems:
+                print_error(f"Verification failed: {p}")
+            for f in files:                    # remove only the NEW files; older backups stay
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            record_last_backup(False, engine=engine)
+            note_failure("verify_fail", detail="\n".join(problems)[:500])
+            return False
+        print_success("Backup verified (archive integrity and database dump checked).")
 
-        ok, details = send_backup_to_telegram(cfg, zip_path, db_type)
-        record_last_backup(ok, zip_path)
-        if ok:
+        removed = register_and_prune(files, cfg.get("keep_backups", 1))
+        if removed:
+            print_info(f"Removed {removed} old backup file(s). Keeping the newest {cfg.get('keep_backups', 1)}.")
+
+        all_ok, last_details = True, ""
+        extra = bot_t(lang, "sha_line", sha=sha[:16]) if sha else ""
+        for f in files:
+            ok, details = send_backup_to_telegram(cfg, f, engine, extra)
+            if not ok:
+                all_ok, last_details = False, details
+                break
+        record_last_backup(all_ok, files[0], size=total_size, sha=sha, engine=engine)
+        if all_ok:
             print_success("Backup sent to Telegram.")
+            note_success()
         else:
-            print_error(f"Sending to Telegram failed: {details}")
-            tg_send(cfg, bot_t(lang, "upload_fail", err=str(details)[:500]))
-        return ok
+            print_error(f"Sending to Telegram failed: {last_details}")
+            note_failure("upload_fail", err=str(last_details)[:500])
+        return all_ok
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
@@ -1941,8 +2354,13 @@ def bot_status_text(cfg):
     cron = bot_t(lang, "on") if os.path.exists(CRON_FILE) else bot_t(lang, "off")
     once = ", ".join(fmt_dt(o["ts"], cfg) for o in sorted(cfg.get("one_time") or [], key=lambda o: o["ts"])) or "-"
     limit = human_size(tg_limits(cfg)[0]).replace(".0 ", " ")
-    return bot_t(lang, "status", host=socket.gethostname(), times=", ".join(cfg.get("times") or []) or "-",
+    base = bot_t(lang, "status", host=socket.gethostname(), times=", ".join(cfg.get("times") or []) or "-",
                  tz=tz_label(cfg), once=once, last=last_txt, file=kept, cron=cron, limit=limit)
+    fails = bot_t(lang, "fails_line", n=cfg["fail_count"]) if int(cfg.get("fail_count") or 0) else ""
+    proxy = "on" if cfg.get("proxy") else "off"
+    extra = bot_t(lang, "status_extra", keep=cfg.get("keep_backups", 1), engine=cfg.get("backup_engine", "auto"),
+                  proxy=proxy, fails=fails)
+    return base + "\n" + extra
 
 def bot_set_times(cfg, times):
     lang = cfg.get("lang", "fa")
@@ -2053,6 +2471,13 @@ def bot_handle_update(upd):
             bot_add_once(cfg, ts)
         else:
             tg_send(cfg, bot_t(lang, "once_bad"))
+    elif cmd == "/keep":
+        digits = arg.translate(_FA_TO_EN).strip()
+        if digits.isdigit() and 1 <= int(digits) <= 30:
+            update_config(lambda c: c.__setitem__("keep_backups", int(digits)))
+            tg_send(cfg, bot_t(lang, "keep_ok", n=int(digits)))
+        else:
+            tg_send(cfg, bot_t(lang, "keep_bad"))
     elif cmd == "/settz":
         name = normalize_tz_name(arg) if arg else None
         if name is None:
@@ -2087,6 +2512,10 @@ def bot_scheduler_loop():
             if now - last_sync > 600:
                 sync_cron_if_needed(cfg)
                 last_sync = now
+            retry_at = cfg.get("retry_at") or 0
+            if retry_at and now >= retry_at and is_configured(cfg) and not backup_is_running():
+                update_config(lambda c: c.__setitem__("retry_at", 0))
+                run_scheduled_backup("retry")
             due = [o for o in (cfg.get("one_time") or []) if o["ts"] <= now]
             if due and is_configured(cfg):
                 due_ts = {o["ts"] for o in due}
@@ -2419,8 +2848,9 @@ def workflow_telegram_manager():
         print(f"{Colors.BLUE}5-{Colors.RESET} Large files up to 2 GB (enable / disable)")
         print(f"{Colors.BLUE}6-{Colors.RESET} Show status")
         print(f"{Colors.BLUE}7-{Colors.RESET} Disable (remove cron job & stop bot)")
-        print(f"{Colors.RED}8-{Colors.RESET} Back to main menu")
-        choice = input(f"\n{Colors.CYAN}Select an option (1-8): {Colors.RESET}").strip()
+        print(f"{Colors.BLUE}8-{Colors.RESET} Advanced (backups kept, proxy, backup engine)")
+        print(f"{Colors.RED}9-{Colors.RESET} Back to main menu")
+        choice = input(f"\n{Colors.CYAN}Select an option (1-9): {Colors.RESET}").strip()
 
         if choice == "1":
             tgm_setup()
@@ -2440,10 +2870,466 @@ def workflow_telegram_manager():
         elif choice == "7":
             tgm_disable()
         elif choice == "8":
+            tgm_advanced()
+        elif choice == "9":
             return
         else:
             print_error("Invalid option!")
         input(f"\n{Colors.YELLOW}Press [ENTER] to continue...{Colors.RESET}")
+
+# ============================================================================
+#  Universal tools (option 6): every database, official PasarGuard archives
+# ============================================================================
+CONVERT_DIR = os.path.join(CONFIG_DIR, "convert")
+MIGRATION_REPO = "https://github.com/PasarGuard/db-migrations.git"
+MIGRATION_DIR = os.path.join(CONFIG_DIR, "db-migrations")
+DOCS_LINKS = (
+    ("Panel configuration (database URLs)", "https://docs.pasarguard.org/en/panel/configuration"),
+    ("Official backup & restore guide", "https://github.com/PasarGuard/scripts/blob/main/docs/backup-and-restore.md"),
+    ("Official CLI reference", "https://github.com/PasarGuard/scripts/blob/main/docs/cli-reference.md"),
+    ("Official database migration tool", "https://github.com/PasarGuard/db-migrations"),
+)
+
+def find_backup_candidates(limit=15):
+    """Backup archives that look like PasarGuard / teperbk backups, newest first."""
+    seen, found = set(), []
+    for d in ("/root", os.getcwd(), OFFICIAL_BACKUP_DIR, BACKUP_DIR):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            p = os.path.realpath(os.path.join(d, name))
+            low = name.lower()
+            if p in seen or not os.path.isfile(p):
+                continue
+            if low.endswith((".zip", ".tar.gz", ".tgz")) or _MULTIPART_RE.search(low):
+                seen.add(p)
+                st = os.stat(p)
+                found.append((st.st_mtime, p, st.st_size))
+    found.sort(reverse=True)
+    return [(p, size) for _m, p, size in found[:limit]]
+
+def choose_backup_file(prompt_title):
+    cands = find_backup_candidates()
+    print_info(prompt_title)
+    for i, (p, size) in enumerate(cands, 1):
+        print(f"  {i}) {p}  ({human_size(size)})")
+    raw = input(f"{Colors.CYAN}Number from the list, or the full path of the file: {Colors.RESET}").strip().strip("'\"")
+    if raw.isdigit() and 1 <= int(raw) <= len(cands):
+        return cands[int(raw) - 1][0]
+    if raw and os.path.isfile(raw):
+        return os.path.abspath(raw)
+    print_error("File not found.")
+    return None
+
+# ---------------------------------------------------------- official backup ----
+def workflow_official_backup():
+    print_header("Backup now (official PasarGuard backup, all databases)")
+    if not ensure_pasarguard_cli():
+        return
+    cfg = load_config()
+    ok_disk, msg = check_disk_space(cfg, official=True)
+    if not ok_disk:
+        print_error(f"Not enough free disk space: {msg}")
+        return
+    files, err = official_backup()
+    if err:
+        print_error(err)
+        return
+    bad = False
+    for f in files:
+        ok, probs, warns, sha = verify_archive(f)
+        print_info(f"{f}  ({human_size(os.path.getsize(f))})  sha256 {sha[:16]}")
+        for w in warns:
+            print_warning(w)
+        for p in probs:
+            print_error(f"Verification failed: {p}")
+            bad = True
+    if bad:
+        return
+    print_success("Official backup created and verified.")
+    print_info(f"Original archive folder: {OFFICIAL_BACKUP_DIR}")
+    register_and_prune(files, cfg.get("keep_backups", 1))
+    print_info(f"Copy kept in {BACKUP_DIR} (restore it with menu 6 -> 2 or 'pasarguard restore').")
+    if is_configured(cfg) and ask_yes_no("Send it to your Telegram bot now? (y/n): ", default=False):
+        for f in files:
+            ok, details = send_backup_to_telegram(cfg, f, "official")
+            print_success("Sent.") if ok else print_error(f"Sending failed: {details}")
+
+# --------------------------------------------------------- official restore ----
+def workflow_official_restore():
+    print_header("Restore a PasarGuard backup (official format, split backups too)")
+    print_info("Works for backups made by 'pasarguard backup' / its Telegram backup service, for every database type.")
+    print_info("The restore itself is done by the official 'pasarguard restore' command.")
+    if not ensure_pasarguard_cli():
+        return
+    path = choose_backup_file("Backup archives found on this server:")
+    if not path:
+        return
+    print_info("For a split backup choose any part. Keep all parts together in the same folder.")
+
+    print_info("Step 1/2: validating the archive (nothing is changed)...")
+    check = subprocess.run([pasarguard_cli(), "restore", path, "--check"])
+    if check.returncode != 0:
+        print_error("The official check reported a problem with this archive.")
+        if not ask_yes_no("Continue anyway? (y/n): ", default=False):
+            return
+
+    existing = os.path.isfile(os.path.join(PASARGUARD_DIR, "docker-compose.yml"))
+    if existing:
+        print_warning("An installation already exists here: the restore will REPLACE its configuration, data and database.")
+        print_info("The official command makes pre-restore copies of what it replaces.")
+        cmd = [pasarguard_cli(), "restore", path]
+    else:
+        print_info("No installation found: this is a new server, so the restore runs in --fresh mode.")
+        print_info("Docker is required. Do not install the panel first; the backup brings everything.")
+        cmd = [pasarguard_cli(), "restore", path, "--fresh"]
+
+    if input(f"{Colors.CYAN}Type RESTORE to continue: {Colors.RESET}").strip() != "RESTORE":
+        print_warning("Cancelled.")
+        return
+    print_info("Step 2/2: restoring (official command output follows)...")
+    result = subprocess.run(cmd)
+    if result.returncode == 0:
+        print_success("Restore finished. Check the panel with: pasarguard status  /  pasarguard logs")
+        print_info("If this is a new server, point your domain (DNS) to it.")
+    else:
+        print_error(f"The official restore exited with code {result.returncode}. Read its messages above.")
+        print_info("You can run the same command again; --fresh continues an interrupted recovery.")
+
+# ------------------------------------------------------ database conversion ----
+def sniff_db_file(path):
+    """sqlite / postgres / mysql, by looking at the file header."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(65536)
+    except OSError:
+        return None
+    if head.startswith(b"SQLite format 3\x00"):
+        return "sqlite"
+    low = head.lower()
+    if b"postgresql database dump" in low:
+        return "postgres"
+    if b"mysql dump" in low or b"mariadb dump" in low:
+        return "mysql"
+    if b"autoincrement" in low or b"pragma foreign_keys" in low:
+        return "sqlite"
+    return None
+
+def _db_members(entries):
+    """entries: [(name, size)] -> database payload candidates, best first."""
+    good = [(n, s) for n, s in entries
+            if s > 0 and n.lower().endswith((".sql", ".sqlite3", ".sqlite", ".db")) and not n.lower().endswith("globals.sql")]
+    def rank(item):
+        base = os.path.basename(item[0]).lower()
+        if base in ("db-001.sql", "db_backup.sql"):
+            return 0
+        return 1 if base.endswith((".sqlite3", ".sqlite", ".db")) else 2
+    return sorted(good, key=lambda it: (rank(it), -it[1]))
+
+def extract_db_from_archive(archive, dest_dir):
+    """Pull the database dump/file out of a backup archive. Returns (path, error)."""
+    os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+    try:
+        if zipfile.is_zipfile(archive):
+            opener = zipfile.ZipFile(archive)
+            entries = [(i.filename, i.file_size) for i in opener.infolist() if not i.is_dir()]
+            read = lambda name: opener.open(name)
+        elif tarfile.is_tarfile(archive):
+            opener = tarfile.open(archive, "r:*")
+            entries = [(m.name, m.size) for m in opener if m.isfile()]
+            read = lambda name: opener.extractfile(name)
+        else:
+            return None, "not a ZIP or tar archive (join split parts first, or restore with menu 6 -> 2)"
+    except Exception as e:
+        return None, f"cannot open the archive: {e}"
+    members = _db_members(entries)
+    if not members:
+        return None, "no database dump or database file found inside the archive"
+    chosen = members[0][0]
+    if len(members) > 1 and _db_members([members[0]])[0] and (os.path.basename(members[0][0]).lower() not in ("db-001.sql", "db_backup.sql")):
+        print_info("Several database files were found:")
+        for i, (n, s) in enumerate(members, 1):
+            print(f"  {i}) {n}  ({human_size(s)})")
+        pick = input(f"{Colors.CYAN}Which one is the PasarGuard database? [1]: {Colors.RESET}").strip() or "1"
+        if pick.isdigit() and 1 <= int(pick) <= len(members):
+            chosen = members[int(pick) - 1][0]
+    out = os.path.join(dest_dir, os.path.basename(chosen))
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as dst, read(chosen) as src:
+        shutil.copyfileobj(src, dst, 4 * MB)
+    return out, None
+
+def env_url_for_migrator(url, role):
+    """Convert a PasarGuard SQLALCHEMY_DATABASE_URL into the format of the official migration tool."""
+    if "://" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    base = scheme.split("+")[0]
+    if base in ("postgresql", "postgres"):
+        return ("postgresql+asyncpg://" if role == "target" else "postgresql://") + rest
+    if base in ("mysql", "mariadb"):
+        return "mysql+pymysql://" + rest
+    if base == "sqlite":
+        return "sqlite://" + rest
+    return url
+
+def url_engine(url):
+    base = url.split("://", 1)[0].split("+")[0] if "://" in url else ""
+    return {"postgresql": "postgres", "postgres": "postgres", "mysql": "mysql", "mariadb": "mysql", "sqlite": "sqlite"}.get(base)
+
+def mask_url(url):
+    return re.sub(r"(://[^:/@]+:)[^@]+(@)", r"\1****\2", url)
+
+def url_reachable(url, timeout=5):
+    if url_engine(url) == "sqlite":
+        return True, ""
+    u = urllib.parse.urlparse(url)
+    port = u.port or (5432 if url_engine(url) == "postgres" else 3306)
+    try:
+        socket.create_connection((u.hostname or "127.0.0.1", port), timeout=timeout).close()
+        return True, ""
+    except OSError as e:
+        return False, f"{u.hostname}:{port} -> {e}"
+
+def ensure_migration_tool():
+    """Clone / update the official PasarGuard db-migrations repository."""
+    if not shutil.which("git"):
+        print_warning("git is required to download the official migration tool.")
+        if not ask_yes_no("Install git with apt now? (y/n): ", default=False):
+            return False
+        run_command("apt-get update")
+        run_command("apt-get install -y git")
+        if not shutil.which("git"):
+            return False
+    if os.path.isdir(os.path.join(MIGRATION_DIR, ".git")):
+        subprocess.run(["git", "-C", MIGRATION_DIR, "pull", "--ff-only"], capture_output=True)
+    else:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        r = subprocess.run(["git", "clone", "--depth", "1", MIGRATION_REPO, MIGRATION_DIR], capture_output=True, text=True)
+        if r.returncode != 0:
+            print_error(f"Could not download the migration tool: {r.stderr.strip()}")
+            return False
+    return os.path.isfile(os.path.join(MIGRATION_DIR, "migrate.sh"))
+
+def workflow_convert_database():
+    print_header("Convert the database engine (official PasarGuard migration tool)")
+    print_info("Moves your PasarGuard data between PostgreSQL / TimescaleDB, MySQL / MariaDB and SQLite.")
+    print_info("It uses the official tool: https://github.com/PasarGuard/db-migrations")
+    print_warning("The TARGET database is erased and filled with your data. Back up first.")
+    print("")
+    print_info("Official flow, in short:")
+    print("  1. Back up the source database (menu 6 -> 1).")
+    print("  2. Install PasarGuard on the TARGET database, SAME app version as the source, and start it once")
+    print("     so it creates its own tables (for example: pasarguard install --database timescaledb).")
+    print("  3. Run this wizard: it moves the data into that target database.")
+    print("  4. Check users, groups, settings and subscriptions in the panel.")
+    if not ask_yes_no("Continue with the conversion wizard? (y/n): ", default=False):
+        return
+
+    # ---- source ----
+    print("")
+    print_info("Where is the data you want to convert?")
+    print("  1) A backup archive (made by teperbk or by 'pasarguard backup')")
+    print("  2) A database file or dump (.sqlite3 / .db / .sql)")
+    print("  3) A live database URL")
+    source_choice = input(f"{Colors.CYAN}Choose [1-3]: {Colors.RESET}").strip()
+    source, source_kind, extracted = None, None, False
+    if source_choice == "1":
+        archive = choose_backup_file("Backup archives found on this server:")
+        if not archive:
+            return
+        source, err = extract_db_from_archive(archive, CONVERT_DIR)
+        if err:
+            print_error(err)
+            return
+        extracted = True
+        print_success(f"Database extracted: {source}")
+    elif source_choice == "2":
+        source = input(f"{Colors.CYAN}Path of the file: {Colors.RESET}").strip().strip("'\"")
+        if not os.path.isfile(source):
+            print_error("File not found.")
+            return
+    elif source_choice == "3":
+        source = input(f"{Colors.CYAN}Source URL (postgresql://... or mysql+pymysql://...): {Colors.RESET}").strip()
+        source_kind = url_engine(source)
+        if not source_kind or source_kind == "sqlite":
+            print_error("Use a postgresql:// or mysql+pymysql:// URL. For SQLite choose option 2.")
+            return
+        source = env_url_for_migrator(source, "source")
+    else:
+        print_error("Invalid choice.")
+        return
+    if source_kind is None:
+        source_kind = sniff_db_file(source)
+    if source_kind is None:
+        print_error("Could not tell what kind of database this file is.")
+        return
+    print_info(f"Source type: {source_kind}")
+
+    # ---- target ----
+    env_file = os.path.join(PASARGUARD_DIR, ".env")
+    panel_url = _read_env_var(env_file, "SQLALCHEMY_DATABASE_URL") or ""
+    target_url = ""
+    if panel_url and ask_yes_no(f"Use the panel installed on THIS server as the target ({mask_url(panel_url)})? (y/n): ", default=True):
+        target_url = env_url_for_migrator(panel_url, "target")
+    else:
+        target_url = input(f"{Colors.CYAN}Target URL (postgresql+asyncpg://..., mysql+pymysql://..., sqlite:///path.db): {Colors.RESET}").strip()
+    target_kind = url_engine(target_url)
+    if not target_kind:
+        print_error("Unknown target URL format.")
+        return
+    if target_kind == source_kind and not (source_kind == "sqlite" and False):
+        print_warning(f"Source and target are both {source_kind}. Converting between the same engine is usually not needed (use a normal restore).")
+        if not ask_yes_no("Continue anyway? (y/n): ", default=False):
+            return
+    reachable, why = url_reachable(target_url)
+    if not reachable:
+        print_error(f"The target database is not reachable: {why}")
+        print_info("Start the target panel/database first, then run this wizard again.")
+        return
+    exclude = input(f"{Colors.CYAN}Tables to skip, comma separated (Enter = migrate everything; usage-log tables can be huge): {Colors.RESET}").strip()
+
+    # ---- gates ----
+    print("")
+    print_info(f"Source : {source if not source.startswith(('postgresql', 'mysql')) else mask_url(source)}  [{source_kind}]")
+    print_info(f"Target : {mask_url(target_url)}  [{target_kind}]")
+    if exclude:
+        print_info(f"Skipped tables: {exclude}")
+    if input(f"{Colors.CYAN}Did you BACK UP the source data? Type yes: {Colors.RESET}").strip().lower() != "yes":
+        print_warning("Cancelled. Make a backup first (menu 6 -> 1).")
+        return
+    if input(f"{Colors.CYAN}Is the target panel the SAME version and already started once (its tables exist)? Type yes: {Colors.RESET}").strip().lower() != "yes":
+        print_warning("Cancelled. Prepare the target panel first.")
+        return
+    print_warning("ALL data in the target database will be deleted.")
+    if input(f"{Colors.CYAN}Type MIGRATE to start: {Colors.RESET}").strip() != "MIGRATE":
+        print_warning("Cancelled.")
+        return
+
+    if not ensure_migration_tool():
+        print_error("The official migration tool is not available.")
+        return
+
+    # ---- run ----
+    if source_kind == "postgres" and os.path.isfile(source):
+        # The official CLI mode treats every .sql file as a MySQL dump, so a PostgreSQL dump must go through its menu.
+        print_info("PostgreSQL dump files must be chosen inside the official wizard. Follow these answers:")
+        print(f"   Main menu       : 1")
+        print(f"   Source type     : 3   (PostgreSQL SQL dump)")
+        print(f"   Dump file path  : {source}")
+        print(f"   Target type     : {'1' if target_kind == 'postgres' else '2' if target_kind == 'mysql' else '3'}")
+        print(f"   Target URL      : {target_url}")
+        print(f"   Excluded tables : {exclude or '(press Enter)'}")
+        print(f"   Proceed         : yes")
+        print_info("Starting the official wizard...")
+        result = subprocess.run(["bash", "migrate.sh"], cwd=MIGRATION_DIR)
+    else:
+        cmd = ["bash", "migrate.sh", source, "--to", target_kind, "--db", target_url]
+        if exclude:
+            cmd += ["--exclude-tables", exclude]
+        print_info("Running the official migration tool...")
+        result = subprocess.run(cmd, cwd=MIGRATION_DIR, input="yes\n", text=True)
+
+    if result.returncode == 0:
+        print_success("Migration tool finished.")
+        print_info("Now: restart the panel (pasarguard restart) and check users, groups, settings and subscriptions.")
+    else:
+        print_error(f"The migration tool exited with code {result.returncode}. Read its messages above.")
+    if extracted and ask_yes_no("Delete the extracted database copy now? (recommended) (y/n): ", default=True):
+        shutil.rmtree(CONVERT_DIR, ignore_errors=True)
+
+# ------------------------------------------------------------------ menu ----
+def workflow_show_docs():
+    print_header("PasarGuard documentation")
+    for title, url in DOCS_LINKS:
+        print(f"  {title}\n    {url}")
+
+def workflow_universal_tools():
+    while True:
+        print_header("Universal Tools (all databases + official PasarGuard backups)")
+        print_info("Supported databases: SQLite, PostgreSQL, TimescaleDB, MySQL, MariaDB")
+        print(f"\n{Colors.BLUE}1-{Colors.RESET} Backup now (official PasarGuard backup, any database)")
+        print(f"{Colors.BLUE}2-{Colors.RESET} Restore a PasarGuard backup (official format, split backups too)")
+        print(f"{Colors.BLUE}3-{Colors.RESET} Convert the database engine (e.g. MariaDB to TimescaleDB, SQLite to PostgreSQL)")
+        print(f"{Colors.BLUE}4-{Colors.RESET} Documentation links")
+        print(f"{Colors.RED}5-{Colors.RESET} Back to main menu")
+        choice = input(f"\n{Colors.CYAN}Select an option (1-5): {Colors.RESET}").strip()
+        if choice == "1":
+            workflow_official_backup()
+        elif choice == "2":
+            workflow_official_restore()
+        elif choice == "3":
+            workflow_convert_database()
+        elif choice == "4":
+            workflow_show_docs()
+        elif choice == "5":
+            return
+        else:
+            print_error("Invalid option!")
+        input(f"\n{Colors.YELLOW}Press [ENTER] to continue...{Colors.RESET}")
+
+# ------------------------------------------- Telegram manager: advanced ----
+def tgm_advanced():
+    while True:
+        print_header("Advanced backup settings")
+        cfg = load_config()
+        proxy = cfg.get("proxy") or ""
+        shown = re.sub(r"(://[^:/@]+:)[^@]+(@)", r"\1****\2", proxy) if proxy else "off"
+        print_info(f"Backups kept on the server : last {cfg.get('keep_backups', 1)}")
+        print_info(f"Telegram proxy             : {shown}")
+        print_info(f"Backup engine              : {cfg.get('backup_engine', 'auto')}  (auto = built-in for TimescaleDB/MySQL/MariaDB, official for SQLite/PostgreSQL)")
+        print(f"\n{Colors.BLUE}1-{Colors.RESET} How many backups to keep on the server (1-30)")
+        print(f"{Colors.BLUE}2-{Colors.RESET} Telegram proxy (HTTP or SOCKS5)")
+        print(f"{Colors.BLUE}3-{Colors.RESET} Backup engine (auto / official)")
+        print(f"{Colors.BLUE}4-{Colors.RESET} Test the Telegram connection")
+        print(f"{Colors.RED}5-{Colors.RESET} Back")
+        choice = input(f"\n{Colors.CYAN}Select an option (1-5): {Colors.RESET}").strip()
+        if choice == "1":
+            raw = input(f"{Colors.CYAN}Number of backups to keep [{cfg.get('keep_backups', 1)}]: {Colors.RESET}").strip().translate(_FA_TO_EN)
+            if raw.isdigit() and 1 <= int(raw) <= 30:
+                update_config(lambda c: c.__setitem__("keep_backups", int(raw)))
+                print_success(f"Keeping the last {raw} backup(s).")
+            elif raw:
+                print_error("Enter a number from 1 to 30.")
+        elif choice == "2":
+            print_info("Examples: socks5://127.0.0.1:1080   socks5://user:pass@host:1080   http://host:3128")
+            raw = input(f"{Colors.CYAN}Proxy (Enter = turn off): {Colors.RESET}").strip()
+            old = cfg.get("proxy", "")
+            update_config(lambda c: c.__setitem__("proxy", raw))
+            if raw:
+                res = tg_api(cfg.get("bot_token", ""), "getMe") if cfg.get("bot_token") else {"ok": False, "description": "bot not connected yet"}
+                if res.get("ok"):
+                    print_success("Telegram is reachable through this proxy.")
+                else:
+                    print_error(f"Test failed: {res.get('description')}")
+                    if not ask_yes_no("Keep this proxy anyway? (y/n): ", default=False):
+                        update_config(lambda c: c.__setitem__("proxy", old))
+            else:
+                print_success("Proxy turned off.")
+        elif choice == "3":
+            raw = input(f"{Colors.CYAN}Engine (auto / official): {Colors.RESET}").strip().lower()
+            if raw in ("auto", "official"):
+                if raw == "official" and not ensure_pasarguard_cli():
+                    print_warning("The official command is needed for this engine. Engine not changed.")
+                else:
+                    update_config(lambda c: c.__setitem__("backup_engine", raw))
+                    print_success(f"Backup engine: {raw}")
+            elif raw:
+                print_error("Type auto or official.")
+        elif choice == "4":
+            if not cfg.get("bot_token"):
+                print_warning("Connect the bot first.")
+            else:
+                res = tg_api(cfg["bot_token"], "getMe")
+                print_success(f"OK: @{res['result'].get('username', '?')}") if res.get("ok") else print_error(f"Failed: {res.get('description')}")
+        elif choice == "5":
+            return
+        else:
+            print_error("Invalid option!")
+        input(f"\n{Colors.YELLOW}Press [ENTER] to continue...{Colors.RESET}")
+
 
 # ------------------------------------------------------------- update ----
 def workflow_update(auto=False):
@@ -2517,10 +3403,11 @@ def main():
         print(f"{Colors.BLUE}3-{Colors.RESET} Manual Restore (From local zip)")
         print(f"{Colors.BLUE}4-{Colors.RESET} Telegram Bot & Daily Schedule (cron job)")
         print(f"{Colors.BLUE}5-{Colors.RESET} Update (get the latest version from GitHub)")
-        print(f"{Colors.RED}6-{Colors.RESET} Exit")
+        print(f"{Colors.BLUE}6-{Colors.RESET} Universal Tools (all databases, official backups, DB conversion)")
+        print(f"{Colors.RED}7-{Colors.RESET} Exit")
         print(f"{Colors.HEADER}--------------------------------------------------{Colors.RESET}")
 
-        choice = input(f"{Colors.CYAN}Please select an option (1-6): {Colors.RESET}").strip()
+        choice = input(f"{Colors.CYAN}Please select an option (1-7): {Colors.RESET}").strip()
 
         db_type = None
         if choice in ['1', '2']:
@@ -2547,6 +3434,8 @@ def main():
                 sys.exit(0)
             pause_and_return()
         elif choice == '6':
+            workflow_universal_tools()
+        elif choice == '7':
             print(f"{Colors.YELLOW}Exiting... Have a great day!{Colors.RESET}")
             sys.exit(0)
         else:
